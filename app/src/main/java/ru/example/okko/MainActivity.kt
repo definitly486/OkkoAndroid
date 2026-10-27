@@ -177,6 +177,10 @@ class MainActivity : Activity() {
         })
 
         content.addView(hero)
+        content.addView(space(12))
+        content.addView(button("Встроенный видеоплеер", false) {
+            startActivity(Intent(this, PlayerActivity::class.java))
+        })
         content.addView(space(24))
         content.addView(label("Исследуйте", 22f, fg, true))
         content.addView(space(12))
@@ -227,6 +231,10 @@ class MainActivity : Activity() {
         addCard("Сериалы", "Сериалы и новые эпизоды", "Открыть")
         addCard("Спорт", "Доступные трансляции", "Открыть")
         addCard("Подписки", "Условия и доступ к контенту", "Открыть")
+        content.addView(space(4))
+        content.addView(button("Встроенный плеер · Widevine", true) {
+            startActivity(Intent(this, PlayerActivity::class.java))
+        })
     }
 
     private fun showSearch() {

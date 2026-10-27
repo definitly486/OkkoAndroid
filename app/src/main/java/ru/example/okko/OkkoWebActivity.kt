@@ -32,6 +32,7 @@ class OkkoWebActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var progress: ProgressBar
     private lateinit var header: TextView
+    private lateinit var headerBar: LinearLayout
     private lateinit var root: FrameLayout
     private lateinit var chromeClient: WebChromeClient
 
@@ -52,30 +53,45 @@ class OkkoWebActivity : Activity() {
             setBackgroundColor(BG)
         }
 
+        headerBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(BG)
+        }
+
         header = TextView(this).apply {
             text = "‹   Okko"
             textSize = 18f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), 0, dp(18), 0)
+            setPadding(dp(18), 0, dp(8), 0)
             setBackgroundColor(BG)
-
             setOnClickListener {
-                if (webView.canGoBack()) {
-                    webView.goBack()
-                } else {
-                    finish()
-                }
+                if (webView.canGoBack()) webView.goBack() else finish()
             }
         }
+        headerBar.addView(header, LinearLayout.LayoutParams(0, -1, 1f))
 
-        page.addView(
-            header,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(52)
-            )
-        )
+        val playerButton = TextView(this).apply {
+            text = "Плеер"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            setBackgroundColor(ACCENT)
+            contentDescription = "Открыть встроенный видеоплеер"
+            setOnClickListener {
+                startActivity(android.content.Intent(this@OkkoWebActivity, PlayerActivity::class.java))
+            }
+        }
+        val playerButtonContainer = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, 0, dp(12), 0)
+            addView(playerButton, LinearLayout.LayoutParams(-2, dp(38)))
+        }
+        headerBar.addView(playerButtonContainer, LinearLayout.LayoutParams(-2, -1))
+
+        page.addView(headerBar, LinearLayout.LayoutParams(-1, dp(52)))
 
         webView = WebView(this)
 
@@ -133,6 +149,20 @@ class OkkoWebActivity : Activity() {
 
             mixedContentMode =
                 WebSettings.MIXED_CONTENT_NEVER_ALLOW
+
+            // Some sites reject Android WebView solely because its default UA
+            // contains the "; wv" marker. Keep the device/Chrome version supplied
+            // by WebView, but omit that marker and identify the compatible browser
+            // engine. This is only a compatibility hint; it does not grant DRM access.
+            userAgentString = userAgentString
+                .replace("; wv", "")
+                .let { ua ->
+                    if (" Version/4.0 " !in ua && "Chrome/" in ua) {
+                        ua.replace(" Chrome/", " Version/4.0 Chrome/")
+                    } else {
+                        ua
+                    }
+                }
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -156,12 +186,12 @@ class OkkoWebActivity : Activity() {
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest
-            ): Boolean = handleNavigation(request.url.toString())
+            ): Boolean = handleNavigation(request.url.toString(), fromPopup = false)
 
             // Older Android WebView versions use the String overload.
             @Suppress("DEPRECATION")
             override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
-                handleNavigation(url)
+                handleNavigation(url, fromPopup = false)
         }
 
         chromeClient = object : WebChromeClient() {
@@ -184,21 +214,21 @@ class OkkoWebActivity : Activity() {
                         view: WebView,
                         request: WebResourceRequest
                     ): Boolean {
-                        handleNavigation(request.url.toString())
+                        handleNavigation(request.url.toString(), fromPopup = true)
                         popup.post { popup.destroy() }
                         return true
                     }
 
                     @Suppress("DEPRECATION")
                     override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
-                        handleNavigation(url)
+                        handleNavigation(url, fromPopup = true)
                         popup.post { popup.destroy() }
                         return true
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                         if (!url.isNullOrBlank() && url != "about:blank") {
-                            handleNavigation(url)
+                            handleNavigation(url, fromPopup = true)
                             popup.post { popup.stopLoading(); popup.destroy() }
                         }
                     }
@@ -229,7 +259,7 @@ class OkkoWebActivity : Activity() {
                 fullscreenView = view
                 fullscreenCallback = callback
 
-                header.visibility = View.GONE
+                headerBar.visibility = View.GONE
                 webView.visibility = View.GONE
                 progress.visibility = View.GONE
 
@@ -252,7 +282,7 @@ class OkkoWebActivity : Activity() {
                 fullscreenCallback?.onCustomViewHidden()
                 fullscreenCallback = null
 
-                header.visibility = View.VISIBLE
+                headerBar.visibility = View.VISIBLE
                 webView.visibility = View.VISIBLE
 
                 window.clearFlags(
@@ -273,15 +303,20 @@ class OkkoWebActivity : Activity() {
         }
     }
 
-    private fun handleNavigation(rawUrl: String): Boolean {
+    private fun handleNavigation(rawUrl: String, fromPopup: Boolean): Boolean {
         val uri = runCatching { android.net.Uri.parse(rawUrl) }.getOrNull() ?: return true
         when (uri.scheme?.lowercase()) {
             "http", "https" -> {
+                if (!fromPopup) {
+                    // Let the main WebView navigate normally; do not call loadUrl()
+                    // from this callback, which can re-trigger interception.
+                    return false
+                }
+                // A target="_blank" / window.open URL is intentionally opened in
+                // the existing WebView instead of starting an external browser.
                 if (::webView.isInitialized) webView.loadUrl(uri.toString())
                 return true
             }
-            // Do not delegate these schemes to Android, which could launch Chrome
-            // or another app. Fail closed for every non-web scheme.
             else -> {
                 Toast.makeText(
                     this,
