@@ -1,14 +1,19 @@
 package ru.example.okko
 
 import android.app.Activity
+import android.content.pm.ActivityInfo
 import android.media.MediaDrm
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -25,6 +30,8 @@ class PlayerActivity : Activity() {
     companion object {
         const val EXTRA_STREAM_URL = "ru.example.okko.EXTRA_STREAM_URL"
         const val EXTRA_LICENSE_URL = "ru.example.okko.EXTRA_LICENSE_URL"
+        private const val FULLSCREEN_ENTER_TEXT = "На весь экран"
+        private const val FULLSCREEN_EXIT_TEXT = "Свернуть"
     }
 
     private val bg = 0xFF0C0D12.toInt()
@@ -39,6 +46,15 @@ class PlayerActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var playerView: PlayerView
     private var player: ExoPlayer? = null
+
+    // Fullscreen support: playerHost (PlayerView + toggle button) is moved between
+    // the scrollable form (`body`) and the top-level `rootContainer`.
+    private lateinit var rootContainer: FrameLayout
+    private lateinit var formRoot: LinearLayout
+    private lateinit var body: LinearLayout
+    private lateinit var playerHost: FrameLayout
+    private lateinit var fullscreenToggle: TextView
+    private var isFullscreen = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,6 +79,7 @@ class PlayerActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
+        formRoot = root
         val header = TextView(this).apply {
             text = "‹   Встроенный плеер"
             textSize = 19f
@@ -74,7 +91,7 @@ class PlayerActivity : Activity() {
         root.addView(header, LinearLayout.LayoutParams(-1, dp(54)))
 
         val scroll = ScrollView(this)
-        val body = LinearLayout(this).apply {
+        body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(8), dp(16), dp(24))
         }
@@ -83,7 +100,33 @@ class PlayerActivity : Activity() {
             setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
             setBackgroundColor(0xFF000000.toInt())
         }
-        body.addView(playerView, LinearLayout.LayoutParams(-1, dp(230)))
+        fullscreenToggle = TextView(this).apply {
+            text = FULLSCREEN_ENTER_TEXT
+            textSize = 12f
+            setTextColor(fg)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setBackgroundColor(0x99000000.toInt())
+            contentDescription = "Переключить полноэкранный режим"
+            // Shown together with the player controller (see listener below).
+            visibility = View.GONE
+            setOnClickListener { setFullscreen(!isFullscreen) }
+        }
+        playerHost = FrameLayout(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            addView(playerView, FrameLayout.LayoutParams(-1, -1))
+            addView(
+                fullscreenToggle,
+                FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+                    setMargins(dp(8), dp(8), dp(8), dp(8))
+                }
+            )
+        }
+        playerView.setControllerVisibilityListener(object : PlayerView.ControllerVisibilityListener {
+            override fun onVisibilityChanged(visibility: Int) {
+                fullscreenToggle.visibility = visibility
+            }
+        })
+        body.addView(playerHost, LinearLayout.LayoutParams(-1, dp(230)))
         body.addView(space(16))
         body.addView(label("Источник видео", 16f, fg, true))
         streamInput = edit("", "HTTPS URL потока DASH (.mpd) или HLS (.m3u8)")
@@ -118,7 +161,92 @@ class PlayerActivity : Activity() {
         body.addView(status, matchWrap())
         scroll.addView(body)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+        rootContainer = FrameLayout(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            addView(root, FrameLayout.LayoutParams(-1, -1))
+        }
+        setContentView(rootContainer)
+    }
+
+    /**
+     * Moves the player out of the form to cover the whole screen (and back).
+     * Fullscreen hides the system bars and switches to landscape for normal
+     * (landscape) video; portrait video keeps the current orientation.
+     */
+    private fun setFullscreen(enable: Boolean) {
+        if (enable == isFullscreen) return
+        isFullscreen = enable
+        (playerHost.parent as? android.view.ViewGroup)?.removeView(playerHost)
+        if (enable) {
+            formRoot.visibility = View.GONE
+            rootContainer.addView(playerHost, FrameLayout.LayoutParams(-1, -1))
+            fullscreenToggle.text = FULLSCREEN_EXIT_TEXT
+            val size = player?.videoSize
+            val portraitVideo = size != null && size.width > 0 && size.height > size.width
+            requestedOrientation = if (portraitVideo) {
+                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+        } else {
+            body.addView(playerHost, 0, LinearLayout.LayoutParams(-1, dp(230)))
+            formRoot.visibility = View.VISIBLE
+            fullscreenToggle.text = FULLSCREEN_ENTER_TEXT
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        applySystemBars(enable)
+    }
+
+    private fun applySystemBars(fullscreen: Boolean) {
+        if (Build.VERSION.SDK_INT >= 28) {
+            // Let video use the display-cutout area on the short edges (landscape).
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = if (fullscreen) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                }
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.insetsController?.let { controller ->
+                if (fullscreen) {
+                    controller.systemBarsBehavior =
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    controller.hide(WindowInsets.Type.systemBars())
+                } else {
+                    controller.show(WindowInsets.Type.systemBars())
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = if (fullscreen) {
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            } else {
+                View.SYSTEM_UI_FLAG_VISIBLE
+            }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Immersive mode can be dropped when focus changes on older Android versions.
+        if (hasFocus && isFullscreen) applySystemBars(true)
+    }
+
+    @Deprecated("Deprecated in Android API")
+    override fun onBackPressed() {
+        if (isFullscreen) {
+            setFullscreen(false)
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
     }
 
     private fun playWithWidevine() {
@@ -180,6 +308,8 @@ class PlayerActivity : Activity() {
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
+                // The diagnostics text lives in the form, so leave fullscreen to show it.
+                if (isFullscreen) setFullscreen(false)
                 status.text = explainPlaybackError(error)
             }
         })
