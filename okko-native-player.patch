@@ -1,0 +1,334 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 6791f44..091ce62 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -47,5 +47,7 @@ android {
+ 
+ dependencies {
+     implementation("androidx.media3:media3-exoplayer:1.5.1")
++    implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
++    implementation("androidx.media3:media3-exoplayer-dash:1.5.1")
+     implementation("androidx.media3:media3-ui:1.5.1")
+ }
+diff --git a/app/src/main/java/ru/example/okko/OkkoWebActivity.kt b/app/src/main/java/ru/example/okko/OkkoWebActivity.kt
+index 7516c0a..c6b2112 100644
+--- a/app/src/main/java/ru/example/okko/OkkoWebActivity.kt
++++ b/app/src/main/java/ru/example/okko/OkkoWebActivity.kt
+@@ -11,6 +11,7 @@ import android.view.WindowManager
+ import android.webkit.CookieManager
+ import android.webkit.WebChromeClient
+ import android.webkit.WebResourceRequest
++import android.webkit.WebResourceResponse
+ import android.webkit.WebSettings
+ import android.webkit.WebView
+ import android.webkit.WebViewClient
+@@ -36,6 +37,11 @@ class OkkoWebActivity : Activity() {
+     private lateinit var root: FrameLayout
+     private lateinit var chromeClient: WebChromeClient
+ 
++    private lateinit var playerButton: TextView
++
++    // Последний HLS/DASH-манифест, который страница сама запросила в WebView.
++    @Volatile private var detectedStreamUrl: String? = null
++
+     private var fullscreenView: View? = null
+     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
+ 
+@@ -72,7 +78,7 @@ class OkkoWebActivity : Activity() {
+         }
+         headerBar.addView(header, LinearLayout.LayoutParams(0, -1, 1f))
+ 
+-        val playerButton = TextView(this).apply {
++        playerButton = TextView(this).apply {
+             text = "Плеер"
+             textSize = 14f
+             setTextColor(Color.WHITE)
+@@ -80,9 +86,7 @@ class OkkoWebActivity : Activity() {
+             setPadding(dp(14), dp(8), dp(14), dp(8))
+             setBackgroundColor(ACCENT)
+             contentDescription = "Открыть встроенный видеоплеер"
+-            setOnClickListener {
+-                startActivity(android.content.Intent(this@OkkoWebActivity, PlayerActivity::class.java))
+-            }
++            setOnClickListener { openInNativePlayer() }
+         }
+         val playerButtonContainer = LinearLayout(this).apply {
+             gravity = Gravity.CENTER
+@@ -173,6 +177,22 @@ class OkkoWebActivity : Activity() {
+                 favicon: android.graphics.Bitmap?
+             ) {
+                 progress.visibility = View.VISIBLE
++                detectedStreamUrl = null
++                updatePlayerButton()
++            }
++
++            // Только запоминаем URL манифеста, который страница запрашивает сама.
++            // Запрос не изменяется и не перехватывается: возвращаем null.
++            override fun shouldInterceptRequest(
++                view: WebView?,
++                request: WebResourceRequest?
++            ): WebResourceResponse? {
++                val url = request?.url?.toString()
++                if (url != null && isManifestUrl(url) && url != detectedStreamUrl) {
++                    detectedStreamUrl = url
++                    runOnUiThread { updatePlayerButton() }
++                }
++                return null
+             }
+ 
+             override fun onPageFinished(
+@@ -303,6 +323,42 @@ class OkkoWebActivity : Activity() {
+         }
+     }
+ 
++    private fun isManifestUrl(url: String): Boolean {
++        val path = runCatching { android.net.Uri.parse(url).path }.getOrNull()?.lowercase() ?: return false
++        return path.endsWith(".m3u8") || path.endsWith(".mpd")
++    }
++
++    private fun updatePlayerButton() {
++        val found = detectedStreamUrl != null
++        playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
++    }
++
++    /** Передаёт найденный манифест во встроенный Media3-плеер вместе с UA/cookies/Referer сессии. */
++    private fun openInNativePlayer() {
++        val stream = detectedStreamUrl
++        val intent = android.content.Intent(this, PlayerActivity::class.java)
++        if (stream == null) {
++            Toast.makeText(
++                this,
++                "Поток не обнаружен: запустите видео на странице",
++                Toast.LENGTH_SHORT
++            ).show()
++        } else {
++            intent.putExtra(PlayerActivity.EXTRA_STREAM_URL, stream)
++            intent.putExtra(PlayerActivity.EXTRA_USER_AGENT, webView.settings.userAgentString)
++            intent.putExtra(PlayerActivity.EXTRA_REFERER, webView.url)
++            CookieManager.getInstance().getCookie(stream)?.let {
++                intent.putExtra(PlayerActivity.EXTRA_COOKIE, it)
++            }
++            // Чтобы звук из страницы не играл параллельно с нативным плеером.
++            webView.evaluateJavascript(
++                "document.querySelectorAll('video,audio').forEach(function(m){m.pause()})",
++                null
++            )
++        }
++        startActivity(intent)
++    }
++
+     private fun handleNavigation(rawUrl: String, fromPopup: Boolean): Boolean {
+         val uri = runCatching { android.net.Uri.parse(rawUrl) }.getOrNull() ?: return true
+         when (uri.scheme?.lowercase()) {
+diff --git a/app/src/main/java/ru/example/okko/PlayerActivity.kt b/app/src/main/java/ru/example/okko/PlayerActivity.kt
+index 143c7f1..a615a3d 100644
+--- a/app/src/main/java/ru/example/okko/PlayerActivity.kt
++++ b/app/src/main/java/ru/example/okko/PlayerActivity.kt
+@@ -4,6 +4,8 @@ import android.app.Activity
+ import android.media.MediaDrm
+ import android.net.Uri
+ import android.os.Bundle
++import android.util.Log
++import android.widget.Toast
+ import android.view.Gravity
+ import android.view.View
+ import android.view.WindowManager
+@@ -16,7 +18,9 @@ import androidx.media3.common.C
+ import androidx.media3.common.MediaItem
+ import androidx.media3.common.PlaybackException
+ import androidx.media3.common.Player
++import androidx.media3.datasource.DefaultHttpDataSource
+ import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+ import androidx.media3.ui.PlayerView
+ import org.json.JSONObject
+ 
+@@ -25,6 +29,9 @@ class PlayerActivity : Activity() {
+     companion object {
+         const val EXTRA_STREAM_URL = "ru.example.okko.EXTRA_STREAM_URL"
+         const val EXTRA_LICENSE_URL = "ru.example.okko.EXTRA_LICENSE_URL"
++        const val EXTRA_USER_AGENT = "ru.example.okko.EXTRA_USER_AGENT"
++        const val EXTRA_COOKIE = "ru.example.okko.EXTRA_COOKIE"
++        const val EXTRA_REFERER = "ru.example.okko.EXTRA_REFERER"
+     }
+ 
+     private val bg = 0xFF0C0D12.toInt()
+@@ -40,21 +47,38 @@ class PlayerActivity : Activity() {
+     private lateinit var playerView: PlayerView
+     private var player: ExoPlayer? = null
+ 
++    companion object Tag {
++        private const val LOG_TAG = "OkkoPlayer"
++    }
++
++    // Сессионные заголовки из WebView; хранятся только в памяти.
++    private var userAgent: String? = null
++    private val httpHeaders = linkedMapOf<String, String>()
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
++        installCrashReporter()
+         window.statusBarColor = bg
+         window.navigationBarColor = bg
+         buildUi()
+-        status.text = widevineDiagnostics()
++        safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
+         // These extras are intended for an authorized integration that already
+         // has provider-issued playback and license URLs. The WebView does not
+         // scrape or extract protected media URLs from the Okko website.
+         val stream = intent.getStringExtra(EXTRA_STREAM_URL).orEmpty()
+         val license = intent.getStringExtra(EXTRA_LICENSE_URL).orEmpty()
+-        if (stream.isNotBlank() && license.isNotBlank()) {
++        userAgent = intent.getStringExtra(EXTRA_USER_AGENT)
++        intent.getStringExtra(EXTRA_COOKIE)?.takeIf { it.isNotBlank() }?.let { httpHeaders["Cookie"] = it }
++        intent.getStringExtra(EXTRA_REFERER)?.takeIf { it.isNotBlank() }?.let { httpHeaders["Referer"] = it }
++        if (stream.isNotBlank()) {
+             streamInput.setText(stream)
+-            licenseInput.setText(license)
+-            streamInput.post { playWithWidevine() }
++            if (license.isNotBlank()) {
++                licenseInput.setText(license)
++                streamInput.post { playWithWidevine() }
++            } else {
++                // Манифест, найденный в WebView: пробуем воспроизвести без DRM.
++                streamInput.post { playWithoutDrm() }
++            }
+         }
+     }
+ 
+@@ -103,12 +127,12 @@ class PlayerActivity : Activity() {
+         body.addView(space(6))
+         body.addView(label("Используйте только URL и параметры авторизации, предоставленные поставщиком контента для вашего аккаунта. Приложение не извлекает защищённые URL или ключи из сайта Okko.", 12f, muted))
+         body.addView(space(14))
+-        body.addView(button("Воспроизвести с Widevine", true) { playWithWidevine() }, matchWrap())
++        body.addView(button("Воспроизвести с Widevine", true) { safe("playWithWidevine") { playWithWidevine() } }, matchWrap())
+         body.addView(space(8))
+-        body.addView(button("Воспроизвести видео без DRM", false) { playWithoutDrm() }, matchWrap())
++        body.addView(button("Воспроизвести видео без DRM", false) { safe("playWithoutDrm") { playWithoutDrm() } }, matchWrap())
+         body.addView(space(8))
+         body.addView(button("Проверить Widevine на устройстве", false) {
+-            status.text = widevineDiagnostics()
++            safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
+         }, matchWrap())
+         body.addView(space(12))
+         body.addView(label("Примечание: кнопка «Плеер» на экране Okko открывает этот экран, но не передаёт автоматически фильм из каталога. Для такой интеграции требуется официальный интерфейс воспроизведения Okko.", 12f, muted))
+@@ -159,34 +183,48 @@ class PlayerActivity : Activity() {
+     }
+ 
+     private fun startPlayback(stream: String, drmConfiguration: MediaItem.DrmConfiguration?) {
+-        releasePlayer()
+-        status.text = if (drmConfiguration == null) {
+-            "Подготовка видео без DRM…"
+-        } else {
+-            "Подключение к потоку и запрос лицензии Widevine…"
+-        }
+-        val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
+-        if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
+-        val exo = ExoPlayer.Builder(this).build()
+-        player = exo
+-        playerView.player = exo
+-        exo.addListener(object : Player.Listener {
+-            override fun onPlaybackStateChanged(playbackState: Int) {
+-                when (playbackState) {
+-                    Player.STATE_BUFFERING -> status.text = "Буферизация: ожидание видео или ответа DRM-лицензии…"
+-                    Player.STATE_READY -> status.text = "Плеер готов."
+-                    Player.STATE_ENDED -> status.text = "Воспроизведение завершено."
+-                    Player.STATE_IDLE -> Unit
+-                }
+-            }
+-            override fun onPlayerError(error: PlaybackException) {
+-                status.text = explainPlaybackError(error)
++        try {
++            releasePlayer()
++            status.text = if (drmConfiguration == null) {
++                "Подготовка видео без DRM…"
++            } else {
++                "Подключение к потоку и запрос лицензии Widevine…"
+             }
+-        })
+-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+-        exo.setMediaItem(itemBuilder.build())
+-        exo.prepare()
+-        exo.playWhenReady = true
++            val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
++            if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
++            val dataSourceFactory = DefaultHttpDataSource.Factory()
++                .setAllowCrossProtocolRedirects(true)
++                .apply {
++                    userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }
++                    if (httpHeaders.isNotEmpty()) setDefaultRequestProperties(httpHeaders)
++                }
++            val exo = ExoPlayer.Builder(this)
++                .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory))
++                .build()
++            player = exo
++            playerView.player = exo
++            exo.addListener(object : Player.Listener {
++                override fun onPlaybackStateChanged(playbackState: Int) {
++                    when (playbackState) {
++                        Player.STATE_BUFFERING -> status.text = "Буферизация: ожидание видео или ответа DRM-лицензии…"
++                        Player.STATE_READY -> status.text = "Плеер готов."
++                        Player.STATE_ENDED -> status.text = "Воспроизведение завершено."
++                        Player.STATE_IDLE -> Unit
++                    }
++                }
++                override fun onPlayerError(error: PlaybackException) {
++                    Log.e(LOG_TAG, "Ошибка воспроизведения", error)
++                    status.text = explainPlaybackError(error)
++                }
++            })
++            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++            exo.setMediaItem(itemBuilder.build())
++            exo.prepare()
++            exo.playWhenReady = true
++        } catch (t: Throwable) {
++            Log.e(LOG_TAG, "Не удалось запустить воспроизведение", t)
++            status.text = "Не удалось запустить плеер: ${t.javaClass.simpleName}: ${t.message ?: "без подробностей"}"
++        }
+     }
+ 
+     private fun parseLicenseHeaders(raw: String): Map<String, String> {
+@@ -289,4 +327,43 @@ class PlayerActivity : Activity() {
+     private fun space(height: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(height)) }
+     private fun matchWrap() = LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT)
+     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
++
++    /**
++     * Выполняет [block] и, если он бросает исключение, показывает причину на экране
++     * (в статусе и всплывающим сообщением) и пишет полный стек в logcat под тегом
++     * "OkkoPlayer". Раньше такие ошибки либо падали молча, либо были видны только
++     * через adb logcat — теперь они всегда отображаются в интерфейсе.
++     */
++    private fun safe(where: String, block: () -> Unit) {
++        try {
++            block()
++        } catch (t: Throwable) {
++            Log.e(LOG_TAG, "Ошибка в $where", t)
++            val message = "Сбой в $where: ${t.javaClass.simpleName}: ${t.message ?: "без подробностей"}"
++            if (::status.isInitialized) status.text = message
++            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
++        }
++    }
++
++    /**
++     * Ловит необработанные исключения (в том числе из колбэков ExoPlayer/MediaDrm,
++     * которые могут выполняться не на UI-потоке) и показывает их перед тем, как
++     * приложение закроется, чтобы "ничего не произошло" не выглядело как тишина.
++     */
++    private fun installCrashReporter() {
++        val previous = Thread.getDefaultUncaughtExceptionHandler()
++        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
++            Log.e(LOG_TAG, "Необработанное исключение в потоке ${thread.name}", throwable)
++            try {
++                Toast.makeText(
++                    applicationContext,
++                    "Критическая ошибка: ${throwable.javaClass.simpleName}: ${throwable.message ?: "без подробностей"}",
++                    Toast.LENGTH_LONG
++                ).show()
++            } catch (_: Throwable) {
++                // Если даже Toast не удаётся показать, просто передаём обработку дальше.
++            }
++            previous?.uncaughtException(thread, throwable)
++        }
++    }
+ }

@@ -1,14 +1,22 @@
 package ru.example.okko
 
 import android.app.Activity
+import android.content.pm.ActivityInfo
 import android.media.MediaDrm
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -16,7 +24,9 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import org.json.JSONObject
 
@@ -25,6 +35,10 @@ class PlayerActivity : Activity() {
     companion object {
         const val EXTRA_STREAM_URL = "ru.example.okko.EXTRA_STREAM_URL"
         const val EXTRA_LICENSE_URL = "ru.example.okko.EXTRA_LICENSE_URL"
+        const val EXTRA_USER_AGENT = "ru.example.okko.EXTRA_USER_AGENT"
+        const val EXTRA_COOKIE = "ru.example.okko.EXTRA_COOKIE"
+        const val EXTRA_REFERER = "ru.example.okko.EXTRA_REFERER"
+        private const val LOG_TAG = "OkkoPlayer"
     }
 
     private val bg = 0xFF0C0D12.toInt()
@@ -40,28 +54,51 @@ class PlayerActivity : Activity() {
     private lateinit var playerView: PlayerView
     private var player: ExoPlayer? = null
 
+    // Элементы, нужные для переключения полноэкранного режима.
+    private lateinit var rootFrame: FrameLayout
+    private lateinit var mainColumn: LinearLayout
+    private lateinit var body: LinearLayout
+    private lateinit var playerContainer: FrameLayout
+    private lateinit var fullscreenButton: TextView
+    private var isFullscreen = false
+
+    // Сессионные заголовки из WebView; хранятся только в памяти.
+    private var userAgent: String? = null
+    private val httpHeaders = linkedMapOf<String, String>()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashReporter()
         window.statusBarColor = bg
         window.navigationBarColor = bg
         buildUi()
-        status.text = widevineDiagnostics()
+        safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
         // These extras are intended for an authorized integration that already
         // has provider-issued playback and license URLs. The WebView does not
         // scrape or extract protected media URLs from the Okko website.
         val stream = intent.getStringExtra(EXTRA_STREAM_URL).orEmpty()
         val license = intent.getStringExtra(EXTRA_LICENSE_URL).orEmpty()
-        if (stream.isNotBlank() && license.isNotBlank()) {
+        userAgent = intent.getStringExtra(EXTRA_USER_AGENT)
+        intent.getStringExtra(EXTRA_COOKIE)?.takeIf { it.isNotBlank() }?.let { httpHeaders["Cookie"] = it }
+        intent.getStringExtra(EXTRA_REFERER)?.takeIf { it.isNotBlank() }?.let { httpHeaders["Referer"] = it }
+        if (stream.isNotBlank()) {
             streamInput.setText(stream)
-            licenseInput.setText(license)
-            streamInput.post { playWithWidevine() }
+            if (license.isNotBlank()) {
+                licenseInput.setText(license)
+                streamInput.post { playWithWidevine() }
+            } else {
+                // Манифест, найденный в WebView: пробуем воспроизвести без DRM.
+                streamInput.post { playWithoutDrm() }
+            }
         }
     }
 
     private fun buildUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        rootFrame = FrameLayout(this).apply {
             setBackgroundColor(bg)
+        }
+        mainColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
         val header = TextView(this).apply {
             text = "‹   Встроенный плеер"
@@ -71,10 +108,10 @@ class PlayerActivity : Activity() {
             setPadding(dp(18), 0, dp(18), 0)
             setOnClickListener { finish() }
         }
-        root.addView(header, LinearLayout.LayoutParams(-1, dp(54)))
+        mainColumn.addView(header, LinearLayout.LayoutParams(-1, dp(54)))
 
         val scroll = ScrollView(this)
-        val body = LinearLayout(this).apply {
+        body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(8), dp(16), dp(24))
         }
@@ -83,7 +120,29 @@ class PlayerActivity : Activity() {
             setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
             setBackgroundColor(0xFF000000.toInt())
         }
-        body.addView(playerView, LinearLayout.LayoutParams(-1, dp(230)))
+        fullscreenButton = TextView(this).apply {
+            text = "⛶"
+            textSize = 18f
+            setTextColor(fg)
+            setBackgroundColor(0x99000000.toInt())
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setOnClickListener { toggleFullscreen() }
+        }
+        playerContainer = FrameLayout(this).apply {
+            addView(playerView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(
+                fullscreenButton,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                    gravity = Gravity.TOP or Gravity.END
+                    setMargins(0, dp(10), dp(10), 0)
+                }
+            )
+        }
+        // Показываем/прячем кнопку вместе с элементами управления плеера.
+        playerView.setControllerVisibilityListener(
+            PlayerView.ControllerVisibilityListener { visibility -> fullscreenButton.visibility = visibility }
+        )
+        body.addView(playerContainer, LinearLayout.LayoutParams(-1, dp(230)))
         body.addView(space(16))
         body.addView(label("Источник видео", 16f, fg, true))
         streamInput = edit("", "HTTPS URL потока DASH (.mpd) или HLS (.m3u8)")
@@ -103,12 +162,12 @@ class PlayerActivity : Activity() {
         body.addView(space(6))
         body.addView(label("Используйте только URL и параметры авторизации, предоставленные поставщиком контента для вашего аккаунта. Приложение не извлекает защищённые URL или ключи из сайта Okko.", 12f, muted))
         body.addView(space(14))
-        body.addView(button("Воспроизвести с Widevine", true) { playWithWidevine() }, matchWrap())
+        body.addView(button("Воспроизвести с Widevine", true) { safe("playWithWidevine") { playWithWidevine() } }, matchWrap())
         body.addView(space(8))
-        body.addView(button("Воспроизвести видео без DRM", false) { playWithoutDrm() }, matchWrap())
+        body.addView(button("Воспроизвести видео без DRM", false) { safe("playWithoutDrm") { playWithoutDrm() } }, matchWrap())
         body.addView(space(8))
         body.addView(button("Проверить Widevine на устройстве", false) {
-            status.text = widevineDiagnostics()
+            safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
         }, matchWrap())
         body.addView(space(12))
         body.addView(label("Примечание: кнопка «Плеер» на экране Okko открывает этот экран, но не передаёт автоматически фильм из каталога. Для такой интеграции требуется официальный интерфейс воспроизведения Okko.", 12f, muted))
@@ -117,8 +176,80 @@ class PlayerActivity : Activity() {
         status = label("Проверка…", 13f, muted)
         body.addView(status, matchWrap())
         scroll.addView(body)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+        mainColumn.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        rootFrame.addView(mainColumn, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        setContentView(rootFrame)
+    }
+
+    /** Переключает полноэкранное воспроизведение: альбомная ориентация + скрытые системные бары. */
+    private fun toggleFullscreen() {
+        if (isFullscreen) exitFullscreen() else enterFullscreen()
+    }
+
+    private fun enterFullscreen() {
+        if (isFullscreen) return
+        isFullscreen = true
+        (playerContainer.parent as? ViewGroup)?.removeView(playerContainer)
+        rootFrame.addView(
+            playerContainer,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
+        playerContainer.bringToFront()
+        mainColumn.visibility = View.GONE
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        hideSystemBars()
+        fullscreenButton.text = "⤢"
+    }
+
+    private fun exitFullscreen() {
+        if (!isFullscreen) return
+        isFullscreen = false
+        (playerContainer.parent as? ViewGroup)?.removeView(playerContainer)
+        body.addView(playerContainer, 0, LinearLayout.LayoutParams(-1, dp(230)))
+        mainColumn.visibility = View.VISIBLE
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        showSystemBars()
+        fullscreenButton.text = "⛶"
+    }
+
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.apply {
+                hide(WindowInsets.Type.systemBars())
+                systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                )
+        }
+    }
+
+    private fun showSystemBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(true)
+            window.insetsController?.show(WindowInsets.Type.systemBars())
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (isFullscreen) {
+            exitFullscreen()
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
     }
 
     private fun playWithWidevine() {
@@ -159,34 +290,48 @@ class PlayerActivity : Activity() {
     }
 
     private fun startPlayback(stream: String, drmConfiguration: MediaItem.DrmConfiguration?) {
-        releasePlayer()
-        status.text = if (drmConfiguration == null) {
-            "Подготовка видео без DRM…"
-        } else {
-            "Подключение к потоку и запрос лицензии Widevine…"
-        }
-        val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
-        if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
-        val exo = ExoPlayer.Builder(this).build()
-        player = exo
-        playerView.player = exo
-        exo.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                when (playbackState) {
-                    Player.STATE_BUFFERING -> status.text = "Буферизация: ожидание видео или ответа DRM-лицензии…"
-                    Player.STATE_READY -> status.text = "Плеер готов."
-                    Player.STATE_ENDED -> status.text = "Воспроизведение завершено."
-                    Player.STATE_IDLE -> Unit
+        try {
+            releasePlayer()
+            status.text = if (drmConfiguration == null) {
+                "Подготовка видео без DRM…"
+            } else {
+                "Подключение к потоку и запрос лицензии Widevine…"
+            }
+            val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
+            if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
+            val dataSourceFactory = DefaultHttpDataSource.Factory()
+                .setAllowCrossProtocolRedirects(true)
+                .apply {
+                    userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }
+                    if (httpHeaders.isNotEmpty()) setDefaultRequestProperties(httpHeaders)
                 }
-            }
-            override fun onPlayerError(error: PlaybackException) {
-                status.text = explainPlaybackError(error)
-            }
-        })
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        exo.setMediaItem(itemBuilder.build())
-        exo.prepare()
-        exo.playWhenReady = true
+            val exo = ExoPlayer.Builder(this)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory))
+                .build()
+            player = exo
+            playerView.player = exo
+            exo.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    when (playbackState) {
+                        Player.STATE_BUFFERING -> status.text = "Буферизация: ожидание видео или ответа DRM-лицензии…"
+                        Player.STATE_READY -> status.text = "Плеер готов."
+                        Player.STATE_ENDED -> status.text = "Воспроизведение завершено."
+                        Player.STATE_IDLE -> Unit
+                    }
+                }
+                override fun onPlayerError(error: PlaybackException) {
+                    Log.e(LOG_TAG, "Ошибка воспроизведения", error)
+                    status.text = explainPlaybackError(error)
+                }
+            })
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            exo.setMediaItem(itemBuilder.build())
+            exo.prepare()
+            exo.playWhenReady = true
+        } catch (t: Throwable) {
+            Log.e(LOG_TAG, "Не удалось запустить воспроизведение", t)
+            status.text = "Не удалось запустить плеер: ${t.javaClass.simpleName}: ${t.message ?: "без подробностей"}"
+        }
     }
 
     private fun parseLicenseHeaders(raw: String): Map<String, String> {
@@ -289,4 +434,43 @@ class PlayerActivity : Activity() {
     private fun space(height: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(height)) }
     private fun matchWrap() = LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT)
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+    /**
+     * Выполняет [block] и, если он бросает исключение, показывает причину на экране
+     * (в статусе и всплывающим сообщением) и пишет полный стек в logcat под тегом
+     * "OkkoPlayer". Раньше такие ошибки либо падали молча, либо были видны только
+     * через adb logcat — теперь они всегда отображаются в интерфейсе.
+     */
+    private fun safe(where: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            Log.e(LOG_TAG, "Ошибка в $where", t)
+            val message = "Сбой в $where: ${t.javaClass.simpleName}: ${t.message ?: "без подробностей"}"
+            if (::status.isInitialized) status.text = message
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * Ловит необработанные исключения (в том числе из колбэков ExoPlayer/MediaDrm,
+     * которые могут выполняться не на UI-потоке) и показывает их перед тем, как
+     * приложение закроется, чтобы "ничего не произошло" не выглядело как тишина.
+     */
+    private fun installCrashReporter() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            Log.e(LOG_TAG, "Необработанное исключение в потоке ${thread.name}", throwable)
+            try {
+                Toast.makeText(
+                    applicationContext,
+                    "Критическая ошибка: ${throwable.javaClass.simpleName}: ${throwable.message ?: "без подробностей"}",
+                    Toast.LENGTH_LONG
+                ).show()
+            } catch (_: Throwable) {
+                // Если даже Toast не удаётся показать, просто передаём обработку дальше.
+            }
+            previous?.uncaughtException(thread, throwable)
+        }
+    }
 }

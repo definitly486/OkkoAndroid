@@ -11,6 +11,7 @@ import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -35,6 +36,11 @@ class OkkoWebActivity : Activity() {
     private lateinit var headerBar: LinearLayout
     private lateinit var root: FrameLayout
     private lateinit var chromeClient: WebChromeClient
+
+    private lateinit var playerButton: TextView
+
+    // Последний HLS/DASH-манифест, который страница сама запросила в WebView.
+    @Volatile private var detectedStreamUrl: String? = null
 
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
@@ -72,7 +78,7 @@ class OkkoWebActivity : Activity() {
         }
         headerBar.addView(header, LinearLayout.LayoutParams(0, -1, 1f))
 
-        val playerButton = TextView(this).apply {
+        playerButton = TextView(this).apply {
             text = "Плеер"
             textSize = 14f
             setTextColor(Color.WHITE)
@@ -80,9 +86,7 @@ class OkkoWebActivity : Activity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
             setBackgroundColor(ACCENT)
             contentDescription = "Открыть встроенный видеоплеер"
-            setOnClickListener {
-                startActivity(android.content.Intent(this@OkkoWebActivity, PlayerActivity::class.java))
-            }
+            setOnClickListener { openInNativePlayer() }
         }
         val playerButtonContainer = LinearLayout(this).apply {
             gravity = Gravity.CENTER
@@ -173,6 +177,22 @@ class OkkoWebActivity : Activity() {
                 favicon: android.graphics.Bitmap?
             ) {
                 progress.visibility = View.VISIBLE
+                detectedStreamUrl = null
+                updatePlayerButton()
+            }
+
+            // Только запоминаем URL манифеста, который страница запрашивает сама.
+            // Запрос не изменяется и не перехватывается: возвращаем null.
+            override fun shouldInterceptRequest(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): WebResourceResponse? {
+                val url = request?.url?.toString()
+                if (url != null && isManifestUrl(url) && url != detectedStreamUrl) {
+                    detectedStreamUrl = url
+                    runOnUiThread { updatePlayerButton() }
+                }
+                return null
             }
 
             override fun onPageFinished(
@@ -301,6 +321,42 @@ class OkkoWebActivity : Activity() {
 
             webView.loadUrl(url)
         }
+    }
+
+    private fun isManifestUrl(url: String): Boolean {
+        val path = runCatching { android.net.Uri.parse(url).path }.getOrNull()?.lowercase() ?: return false
+        return path.endsWith(".m3u8") || path.endsWith(".mpd")
+    }
+
+    private fun updatePlayerButton() {
+        val found = detectedStreamUrl != null
+        playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
+    }
+
+    /** Передаёт найденный манифест во встроенный Media3-плеер вместе с UA/cookies/Referer сессии. */
+    private fun openInNativePlayer() {
+        val stream = detectedStreamUrl
+        val intent = android.content.Intent(this, PlayerActivity::class.java)
+        if (stream == null) {
+            Toast.makeText(
+                this,
+                "Поток не обнаружен: запустите видео на странице",
+                Toast.LENGTH_SHORT
+            ).show()
+        } else {
+            intent.putExtra(PlayerActivity.EXTRA_STREAM_URL, stream)
+            intent.putExtra(PlayerActivity.EXTRA_USER_AGENT, webView.settings.userAgentString)
+            intent.putExtra(PlayerActivity.EXTRA_REFERER, webView.url)
+            CookieManager.getInstance().getCookie(stream)?.let {
+                intent.putExtra(PlayerActivity.EXTRA_COOKIE, it)
+            }
+            // Чтобы звук из страницы не играл параллельно с нативным плеером.
+            webView.evaluateJavascript(
+                "document.querySelectorAll('video,audio').forEach(function(m){m.pause()})",
+                null
+            )
+        }
+        startActivity(intent)
     }
 
     private fun handleNavigation(rawUrl: String, fromPopup: Boolean): Boolean {
