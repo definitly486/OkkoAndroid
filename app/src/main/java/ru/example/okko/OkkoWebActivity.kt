@@ -9,6 +9,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -51,6 +52,11 @@ class OkkoWebActivity : Activity() {
 
         window.statusBarColor = BG
         window.navigationBarColor = BG
+
+        // chrome://inspect для отладки EME/DRM — только в debug-сборках.
+        WebView.setWebContentsDebuggingEnabled(
+            (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        )
 
         root = FrameLayout(this)
 
@@ -143,7 +149,7 @@ class OkkoWebActivity : Activity() {
             domStorageEnabled = true
             databaseEnabled = true
 
-            mediaPlaybackRequiresUserGesture = true
+            mediaPlaybackRequiresUserGesture = false
             javaScriptCanOpenWindowsAutomatically = false
             // Required so target="_blank" is captured by onCreateWindow above.
             setSupportMultipleWindows(true)
@@ -256,6 +262,24 @@ class OkkoWebActivity : Activity() {
                 transport.webView = popup
                 message.sendToTarget()
                 return true
+            }
+
+            // Widevine/EME: страница запрашивает PROTECTED_MEDIA_ID, чтобы
+            // WebView мог получить DRM-лицензию так же, как в браузере.
+            // Разрешаем только этот ресурс и только для https-источников;
+            // камера/микрофон и прочее отклоняются.
+            override fun onPermissionRequest(request: PermissionRequest) {
+                runOnUiThread {
+                    val secure = request.origin?.scheme.equals("https", ignoreCase = true)
+                    val allowed = request.resources
+                        .filter { it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID }
+                        .toTypedArray()
+                    if (secure && allowed.isNotEmpty()) {
+                        request.grant(allowed)
+                    } else {
+                        request.deny()
+                    }
+                }
             }
 
             override fun onProgressChanged(

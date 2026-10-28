@@ -17,6 +17,8 @@
 
         <activity
             android:name=".OkkoWebActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
+            android:hardwareAccelerated="true"
             android:exported="false" />
 
         <activity
