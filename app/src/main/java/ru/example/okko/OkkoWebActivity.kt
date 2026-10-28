@@ -34,13 +34,24 @@ class OkkoWebActivity : Activity() {
 
         private const val BG = 0xFF0C0D12.toInt()
         private const val ACCENT = 0xFFFF486E.toInt()
+        private const val BTN_IDLE = 0xFF343642.toInt()
+        private const val BTN_AUDIO_ACTIVE = 0xFF2E9E5B.toInt()
+
+        // true: в режиме «Только звук» WebView всегда считается видимым, видео продолжает
+        // декодироваться (без этого звук в фоне останавливается). false: Chromium сам отключает
+        // видеодорожку в фоне, но звук может встать.
+        private const val KEEP_PAGE_VISIBLE = true
+
+        // Перед уходом в фон снижать качество в плеере okko (и вернуть «Авто» при выходе).
+        private const val LOWER_QUALITY_FOR_AUDIO = true
+        private const val QUALITY_STEP_DELAY_MS = 2600L
         private const val MAX_MANIFESTS = 12
     }
 
     // Громкость свайпом по правому краю (работает и в полноэкранном видео).
     private lateinit var volumeSwipe: VolumeSwipeController
 
-    private lateinit var webView: WebView
+    private lateinit var webView: BackgroundWebView
     private lateinit var progress: ProgressBar
     private lateinit var header: TextView
     private lateinit var headerBar: LinearLayout
@@ -49,6 +60,7 @@ class OkkoWebActivity : Activity() {
 
     private lateinit var playerButton: TextView
     private lateinit var backgroundButton: TextView
+    private lateinit var audioOnlyButton: TextView
     private var webAudioBackgroundEnabled = false
     private var inPictureInPicture = false
 
@@ -149,13 +161,13 @@ class OkkoWebActivity : Activity() {
         }
         headerBar.addView(backgroundButtonContainer, LinearLayout.LayoutParams(-2, -1))
 
-        val audioOnlyButton = TextView(this).apply {
+        audioOnlyButton = TextView(this).apply {
             text = "♫ Только звук"
             textSize = 13f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             setPadding(dp(9), dp(8), dp(9), dp(8))
-            setBackgroundColor(0xFF343642.toInt())
+            setBackgroundColor(BTN_IDLE)
             contentDescription = "Продолжить звук в фоне"
             setOnClickListener { toggleWebAudioBackground() }
         }
@@ -168,7 +180,7 @@ class OkkoWebActivity : Activity() {
 
         page.addView(headerBar, LinearLayout.LayoutParams(-1, dp(52)))
 
-        webView = WebView(this)
+        webView = BackgroundWebView(this)
 
         page.addView(
             webView,
@@ -252,6 +264,7 @@ class OkkoWebActivity : Activity() {
                 progress.visibility = View.VISIBLE
                 clearManifests()
                 updatePlayerButton()
+                view?.evaluateJavascript(PageTweaks.HIDE_OPEN_IN_APP, null)
             }
 
             // Только запоминаем URL манифеста, который страница запрашивает сама.
@@ -273,6 +286,7 @@ class OkkoWebActivity : Activity() {
             ) {
                 progress.visibility = View.GONE
                 CookieManager.getInstance().flush()
+                view?.evaluateJavascript(PageTweaks.HIDE_OPEN_IN_APP, null)
             }
 
             override fun shouldOverrideUrlLoading(
@@ -289,8 +303,18 @@ class OkkoWebActivity : Activity() {
         chromeClient = object : WebChromeClient() {
 
             override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
-                if (consoleMessage.message().startsWith("OKKO_BG_AUDIO:")) {
-                    android.util.Log.i("OkkoWebAudio", consoleMessage.message())
+                val msg = consoleMessage.message()
+                if (msg.startsWith("OKKO_BG_AUDIO:")) {
+                    android.util.Log.i("OkkoWebAudio", msg)
+                } else if (msg.startsWith("OKKO_QUALITY:")) {
+                    android.util.Log.i("OkkoWebAudio", msg)
+                    val text = when {
+                        msg.startsWith("OKKO_QUALITY:ok low") ->
+                            "Качество снижено: " + msg.removePrefix("OKKO_QUALITY:ok low").trim()
+                        msg.startsWith("OKKO_QUALITY:ok auto") -> "Качество: Авто"
+                        else -> "Не нашёл переключатель качества — выберите вручную"
+                    }
+                    runOnUiThread { Toast.makeText(this@OkkoWebActivity, text, Toast.LENGTH_SHORT).show() }
                 }
                 return true
             }
@@ -467,6 +491,15 @@ class OkkoWebActivity : Activity() {
         return path.endsWith(".m3u8") || path.endsWith(".mpd")
     }
 
+    /** Зелёная кнопка «✓ Только звук» — режим активен; повторное нажатие выключает его. */
+    private fun updateAudioOnlyButton() {
+        if (!::audioOnlyButton.isInitialized) return
+        audioOnlyButton.setBackgroundColor(if (webAudioBackgroundEnabled) BTN_AUDIO_ACTIVE else BTN_IDLE)
+        audioOnlyButton.text = if (webAudioBackgroundEnabled) "✓ Только звук" else "♫ Только звук"
+        audioOnlyButton.contentDescription =
+            if (webAudioBackgroundEnabled) "Выйти из режима «только звук»" else "Продолжить звук в фоне"
+    }
+
     private fun updatePlayerButton() {
         val found = manifestSnapshot().isNotEmpty()
         playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
@@ -476,73 +509,20 @@ class OkkoWebActivity : Activity() {
      * останавливают декодирование, если video становится 1x1, уходит за экран или скрывается. */
     private fun toggleWebAudioBackground() {
         if (!webAudioBackgroundEnabled) {
+            // Android 13+: без разрешения уведомление сервиса не покажется.
+            if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 4102)
+            }
             webAudioBackgroundEnabled = true
+            updateAudioOnlyButton()
             // Keep the original WebView media element and stream. Some sites pause
             // HTML media on visibilitychange/page hide; while the user explicitly
             // enabled background audio, retry playback only if it was already playing.
-            webView.evaluateJavascript(
-                """
-                (function() {
-                  window.__okkoBackgroundAudio = true;
-                  function report(v, eventName) {
-                    try { console.log('OKKO_BG_AUDIO:event=' + eventName +
-                      ',tag=' + v.tagName + ',paused=' + v.paused + ',ended=' + v.ended +
-                      ',readyState=' + v.readyState + ',networkState=' + v.networkState +
-                      ',currentTime=' + Math.round(v.currentTime) + ',error=' + (v.error ? v.error.code : 0) +
-                      ',hidden=' + document.hidden); } catch (_) {}
-                  }
-                  console.log('OKKO_BG_AUDIO:enabled hidden=' + document.hidden +
-                    ' url=' + location.href + ' mediaCount=' + document.querySelectorAll('video,audio').length);
-                  function attach(v) {
-                    if (v.__okkoBgAudioAttached) return;
-                    v.__okkoBgAudioAttached = true;
-                    v.__okkoBgWasPlaying = !v.paused && !v.ended;
-                    ['play','playing','pause','waiting','stalled','suspend','ended','error','emptied','abort'].forEach(function(name) {
-                      v.addEventListener(name, function() { report(v, name); }, true);
-                    });
-                    v.addEventListener('play', function() { v.__okkoBgWasPlaying = true; }, true);
-                    v.addEventListener('playing', function() { v.__okkoBgWasPlaying = true; }, true);
-                    v.addEventListener('pause', function() {
-                      if (!window.__okkoBackgroundAudio || !document.hidden ||
-                          !v.__okkoBgWasPlaying || v.ended) return;
-                      // Defer until the site's pause handler has completed.
-                      Promise.resolve().then(function() {
-                        if (window.__okkoBackgroundAudio && document.hidden &&
-                            v.__okkoBgWasPlaying && !v.ended) {
-                          var p = v.play();
-                          if (p && p.catch) p.catch(function() {});
-                        }
-                      });
-                    }, true);
-                    if (!v.hasAttribute('data-okko-original-style')) {
-                      v.setAttribute('data-okko-original-style', v.getAttribute('style') || '');
-                    }
-                    // Hide pixels without removing the media element or changing its layout.
-                    v.style.setProperty('opacity', '0.01', 'important');
-                  }
-                  document.querySelectorAll('video,audio').forEach(attach);
-                  if (!window.__okkoBgAudioObserver) {
-                    window.__okkoBgAudioObserver = new MutationObserver(function() {
-                      document.querySelectorAll('video,audio').forEach(attach);
-                    });
-                    window.__okkoBgAudioObserver.observe(document.documentElement,
-                      {childList:true, subtree:true});
-                  }
-                  document.addEventListener('visibilitychange', function() {
-                    console.log('OKKO_BG_AUDIO:visibility hidden=' + document.hidden +
-                      ' mediaCount=' + document.querySelectorAll('video,audio').length);
-                    if (!window.__okkoBackgroundAudio || !document.hidden) return;
-                    document.querySelectorAll('video,audio').forEach(function(v) {
-                      if (v.__okkoBgWasPlaying && v.paused && !v.ended) {
-                        var p = v.play(); if (p && p.catch) p.catch(function(){});
-                      }
-                    });
-                  });
-                  return true;
-                })()
-                """.trimIndent(),
-                null
-            )
+            webView.keepVisible = KEEP_PAGE_VISIBLE
+            webView.evaluateJavascript(BackgroundJs.ENABLE, null)
             // Keep the fullscreen custom view fully opaque and attached. The Activity is
             // moved behind other tasks, so its pixels are not visible to the user anyway;
             // lowering alpha can let the compositor treat the video surface as transparent.
@@ -551,31 +531,28 @@ class OkkoWebActivity : Activity() {
                     .putExtra("web_audio_mode", true)
                 if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
                 Toast.makeText(this, "Режим звука включён. Для полного выключения дисплея нажмите кнопку питания.", Toast.LENGTH_LONG).show()
-                moveTaskToBack(true)
+                if (LOWER_QUALITY_FOR_AUDIO) {
+                    // Даём плееру время переключить качество, потом сворачиваемся.
+                    webView.evaluateJavascript(QualityJs.lowest(), null)
+                    webView.postDelayed({
+                        if (webAudioBackgroundEnabled && !isFinishing) moveTaskToBack(true)
+                    }, QUALITY_STEP_DELAY_MS)
+                } else {
+                    moveTaskToBack(true)
+                }
             } catch (t: Throwable) {
                 webAudioBackgroundEnabled = false
-                webView.evaluateJavascript(
-                    "window.__okkoBackgroundAudio=false;" +
-                        "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
-                        "(function(){document.querySelectorAll('[data-okko-original-style]').forEach(function(v){" +
-                        "var s=v.getAttribute('data-okko-original-style');" +
-                        "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
-                        "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
-                    null
-                )
+                updateAudioOnlyButton()
+                webView.keepVisible = false
+                webView.evaluateJavascript(BackgroundJs.DISABLE, null)
                 Toast.makeText(this, "Не удалось включить фон: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
             }
         } else {
             webAudioBackgroundEnabled = false
-            webView.evaluateJavascript(
-                "window.__okkoBackgroundAudio=false;" +
-                    "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
-                    "(function(){document.querySelectorAll('[data-okko-original-style]').forEach(function(v){" +
-                    "var s=v.getAttribute('data-okko-original-style');" +
-                    "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
-                    "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
-                null
-            )
+            updateAudioOnlyButton()
+            webView.keepVisible = false
+            webView.evaluateJavascript(BackgroundJs.DISABLE, null)
+            if (LOWER_QUALITY_FOR_AUDIO) webView.evaluateJavascript(QualityJs.auto(), null)
             stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
             Toast.makeText(this, "Фоновый режим выключен", Toast.LENGTH_SHORT).show()
         }
@@ -771,7 +748,11 @@ class OkkoWebActivity : Activity() {
     override fun onDestroy() {
         android.util.Log.i("OkkoWebAudio", "Activity onDestroy; backgroundMode=$webAudioBackgroundEnabled")
         if (::volumeSwipe.isInitialized) volumeSwipe.release()
+        if (webAudioBackgroundEnabled) {
+            stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
+        }
         if (::webView.isInitialized) {
+            webView.keepVisible = false
             webView.stopLoading()
             webView.destroy()
         }

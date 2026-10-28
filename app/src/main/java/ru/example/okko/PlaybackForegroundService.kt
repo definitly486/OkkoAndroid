@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.content.Intent
 import android.os.Build
@@ -26,6 +27,7 @@ class PlaybackForegroundService : Service() {
     private var activePlayer: ExoPlayer? = null
     private var webAudioMode = false
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -58,6 +60,16 @@ class PlaybackForegroundService : Service() {
                 ).apply { setReferenceCounted(false) }
             }
             if (wakeLock?.isHeld != true) wakeLock?.acquire()
+            // Чтобы Wi-Fi не засыпал вместе с экраном и поток не прерывался.
+            if (wifiLock == null) {
+                val wifi = applicationContext.getSystemService(WifiManager::class.java)
+                @Suppress("DEPRECATION")
+                wifiLock = wifi?.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                    "$packageName:WebViewAudio"
+                )?.apply { setReferenceCounted(false) }
+            }
+            if (wifiLock?.isHeld != true) wifiLock?.acquire()
         } else {
             releaseWebAudioResources()
         }
@@ -95,6 +107,8 @@ class PlaybackForegroundService : Service() {
     private fun releaseWebAudioResources() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
     }
 
     override fun onDestroy() {

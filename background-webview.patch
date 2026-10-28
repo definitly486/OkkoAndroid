@@ -1,0 +1,678 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index d57fd71..be345ea 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -6,6 +6,7 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+     <uses-permission android:name="android.permission.WAKE_LOCK" />
++    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ 
+     <application
+         android:allowBackup="false"
+diff --git a/app/src/main/java/ru/example/okko/BackgroundJs.kt b/app/src/main/java/ru/example/okko/BackgroundJs.kt
+new file mode 100644
+index 0000000..838ad39
+--- /dev/null
++++ b/app/src/main/java/ru/example/okko/BackgroundJs.kt
+@@ -0,0 +1,109 @@
++package ru.example.okko
++
++/** JS для режима «Только звук» в WebView. */
++internal object BackgroundJs {
++
++    /**
++     * Скрывает от страницы факт сворачивания: document.hidden/visibilityState остаются
++     * «видимыми», а visibilitychange/pagehide/freeze не доходят до обработчиков сайта
++     * (многие плееры по ним ставят паузу). Если сайт всё же поставил паузу —
++     * возобновляем то, что играло до этого.
++     */
++    const val ENABLE = """
++(function() {
++  window.__okkoBackgroundAudio = true;
++  function realHidden() {
++    try { return !!Object.getOwnPropertyDescriptor(Document.prototype, 'hidden').get.call(document); }
++    catch (_) { return false; }
++  }
++  window.__okkoRealHidden = realHidden;
++
++  if (!window.__okkoVisSpoof) {
++    window.__okkoVisSpoof = true;
++    var block = function(e) { if (window.__okkoBackgroundAudio) e.stopImmediatePropagation(); };
++    ['visibilitychange', 'webkitvisibilitychange', 'pagehide', 'freeze'].forEach(function(n) {
++      window.addEventListener(n, block, true);
++      document.addEventListener(n, block, true);
++    });
++    function spoof(prop, fake) {
++      try {
++        var d = Object.getOwnPropertyDescriptor(Document.prototype, prop);
++        if (!d || !d.get) return;
++        Object.defineProperty(document, prop, {
++          configurable: true,
++          get: function() { return window.__okkoBackgroundAudio ? fake : d.get.call(document); }
++        });
++      } catch (_) {}
++    }
++    spoof('hidden', false);
++    spoof('webkitHidden', false);
++    spoof('visibilityState', 'visible');
++    spoof('webkitVisibilityState', 'visible');
++  }
++
++  function resume(v) {
++    if (!window.__okkoBackgroundAudio || !v.__okkoWasPlaying || v.ended) return;
++    var p = v.play();
++    if (p && p.catch) p.catch(function() {});
++  }
++
++  function attach(v) {
++    if (v.__okkoBgAttached) return;
++    v.__okkoBgAttached = true;
++    v.__okkoWasPlaying = !v.paused && !v.ended;
++    v.addEventListener('play', function() { v.__okkoWasPlaying = true; }, true);
++    v.addEventListener('playing', function() { v.__okkoWasPlaying = true; }, true);
++    v.addEventListener('ended', function() { v.__okkoWasPlaying = false; }, true);
++    v.addEventListener('pause', function() {
++      if (!v.__okkoWasPlaying || v.ended || !realHidden()) return;
++      // Дадим сайту завершить свой обработчик паузы, затем продолжим.
++      setTimeout(function() { if (v.paused) resume(v); }, 0);
++    }, true);
++    if (!v.hasAttribute('data-okko-original-style')) {
++      v.setAttribute('data-okko-original-style', v.getAttribute('style') || '');
++    }
++    v.style.setProperty('opacity', '0.01', 'important');
++  }
++
++  document.querySelectorAll('video,audio').forEach(attach);
++  if (!window.__okkoBgAudioObserver) {
++    window.__okkoBgAudioObserver = new MutationObserver(function() {
++      document.querySelectorAll('video,audio').forEach(attach);
++    });
++    window.__okkoBgAudioObserver.observe(document.documentElement, {childList: true, subtree: true});
++  }
++  // Для проверки по logcat: пока видео не декодируется, totalVideoFrames не растёт.
++  if (window.__okkoFrameLog) clearInterval(window.__okkoFrameLog);
++  window.__okkoFrameLog = setInterval(function() {
++    document.querySelectorAll('video').forEach(function(v) {
++      try {
++        var q = v.getVideoPlaybackQuality();
++        console.log('OKKO_BG_AUDIO:frames total=' + q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames +
++          ' paused=' + v.paused + ' t=' + Math.round(v.currentTime));
++      } catch (_) {}
++    });
++  }, 5000);
++  console.log('OKKO_BG_AUDIO:enabled url=' + location.href +
++    ' mediaCount=' + document.querySelectorAll('video,audio').length);
++  return true;
++})()
++"""
++
++    const val DISABLE = """
++(function() {
++  window.__okkoBackgroundAudio = false;
++  if (window.__okkoFrameLog) { clearInterval(window.__okkoFrameLog); window.__okkoFrameLog = null; }
++  if (window.__okkoBgAudioObserver) {
++    window.__okkoBgAudioObserver.disconnect();
++    window.__okkoBgAudioObserver = null;
++  }
++  document.querySelectorAll('[data-okko-original-style]').forEach(function(v) {
++    var s = v.getAttribute('data-okko-original-style');
++    if (s) { v.setAttribute('style', s); } else { v.removeAttribute('style'); }
++    v.removeAttribute('data-okko-original-style');
++    v.__okkoBgAttached = false;
++  });
++  return true;
++})()
++"""
++}
+diff --git a/app/src/main/java/ru/example/okko/BackgroundWebView.kt b/app/src/main/java/ru/example/okko/BackgroundWebView.kt
+new file mode 100644
+index 0000000..9ca60b5
+--- /dev/null
++++ b/app/src/main/java/ru/example/okko/BackgroundWebView.kt
+@@ -0,0 +1,24 @@
++package ru.example.okko
++
++import android.content.Context
++import android.view.View
++import android.webkit.WebView
++
++/**
++ * WebView, который в режиме «Только звук» продолжает считать себя видимым,
++ * когда Activity свёрнута/остановлена. Без этого Chromium получает onHide(),
++ * переводит страницу в hidden и приостанавливает воспроизведение.
++ */
++class BackgroundWebView(context: Context) : WebView(context) {
++
++    @Volatile
++    var keepVisible = false
++
++    override fun onWindowVisibilityChanged(visibility: Int) {
++        super.onWindowVisibilityChanged(if (keepVisible) View.VISIBLE else visibility)
++    }
++
++    override fun onVisibilityChanged(changedView: View, visibility: Int) {
++        super.onVisibilityChanged(changedView, if (keepVisible) View.VISIBLE else visibility)
++    }
++}
+diff --git a/app/src/main/java/ru/example/okko/OkkoWebActivity.kt b/app/src/main/java/ru/example/okko/OkkoWebActivity.kt
+index 50587cd..b4bae0f 100644
+--- a/app/src/main/java/ru/example/okko/OkkoWebActivity.kt
++++ b/app/src/main/java/ru/example/okko/OkkoWebActivity.kt
+@@ -34,13 +34,24 @@ class OkkoWebActivity : Activity() {
+ 
+         private const val BG = 0xFF0C0D12.toInt()
+         private const val ACCENT = 0xFFFF486E.toInt()
++        private const val BTN_IDLE = 0xFF343642.toInt()
++        private const val BTN_AUDIO_ACTIVE = 0xFF2E9E5B.toInt()
++
++        // true: в режиме «Только звук» WebView всегда считается видимым, видео продолжает
++        // декодироваться (без этого звук в фоне останавливается). false: Chromium сам отключает
++        // видеодорожку в фоне, но звук может встать.
++        private const val KEEP_PAGE_VISIBLE = true
++
++        // Перед уходом в фон снижать качество в плеере okko (и вернуть «Авто» при выходе).
++        private const val LOWER_QUALITY_FOR_AUDIO = true
++        private const val QUALITY_STEP_DELAY_MS = 2600L
+         private const val MAX_MANIFESTS = 12
+     }
+ 
+     // Громкость свайпом по правому краю (работает и в полноэкранном видео).
+     private lateinit var volumeSwipe: VolumeSwipeController
+ 
+-    private lateinit var webView: WebView
++    private lateinit var webView: BackgroundWebView
+     private lateinit var progress: ProgressBar
+     private lateinit var header: TextView
+     private lateinit var headerBar: LinearLayout
+@@ -49,6 +60,7 @@ class OkkoWebActivity : Activity() {
+ 
+     private lateinit var playerButton: TextView
+     private lateinit var backgroundButton: TextView
++    private lateinit var audioOnlyButton: TextView
+     private var webAudioBackgroundEnabled = false
+     private var inPictureInPicture = false
+ 
+@@ -149,13 +161,13 @@ class OkkoWebActivity : Activity() {
+         }
+         headerBar.addView(backgroundButtonContainer, LinearLayout.LayoutParams(-2, -1))
+ 
+-        val audioOnlyButton = TextView(this).apply {
++        audioOnlyButton = TextView(this).apply {
+             text = "♫ Только звук"
+             textSize = 13f
+             setTextColor(Color.WHITE)
+             gravity = Gravity.CENTER
+             setPadding(dp(9), dp(8), dp(9), dp(8))
+-            setBackgroundColor(0xFF343642.toInt())
++            setBackgroundColor(BTN_IDLE)
+             contentDescription = "Продолжить звук в фоне"
+             setOnClickListener { toggleWebAudioBackground() }
+         }
+@@ -168,7 +180,7 @@ class OkkoWebActivity : Activity() {
+ 
+         page.addView(headerBar, LinearLayout.LayoutParams(-1, dp(52)))
+ 
+-        webView = WebView(this)
++        webView = BackgroundWebView(this)
+ 
+         page.addView(
+             webView,
+@@ -252,6 +264,7 @@ class OkkoWebActivity : Activity() {
+                 progress.visibility = View.VISIBLE
+                 clearManifests()
+                 updatePlayerButton()
++                view?.evaluateJavascript(PageTweaks.HIDE_OPEN_IN_APP, null)
+             }
+ 
+             // Только запоминаем URL манифеста, который страница запрашивает сама.
+@@ -273,6 +286,7 @@ class OkkoWebActivity : Activity() {
+             ) {
+                 progress.visibility = View.GONE
+                 CookieManager.getInstance().flush()
++                view?.evaluateJavascript(PageTweaks.HIDE_OPEN_IN_APP, null)
+             }
+ 
+             override fun shouldOverrideUrlLoading(
+@@ -289,8 +303,18 @@ class OkkoWebActivity : Activity() {
+         chromeClient = object : WebChromeClient() {
+ 
+             override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+-                if (consoleMessage.message().startsWith("OKKO_BG_AUDIO:")) {
+-                    android.util.Log.i("OkkoWebAudio", consoleMessage.message())
++                val msg = consoleMessage.message()
++                if (msg.startsWith("OKKO_BG_AUDIO:")) {
++                    android.util.Log.i("OkkoWebAudio", msg)
++                } else if (msg.startsWith("OKKO_QUALITY:")) {
++                    android.util.Log.i("OkkoWebAudio", msg)
++                    val text = when {
++                        msg.startsWith("OKKO_QUALITY:ok low") ->
++                            "Качество снижено: " + msg.removePrefix("OKKO_QUALITY:ok low").trim()
++                        msg.startsWith("OKKO_QUALITY:ok auto") -> "Качество: Авто"
++                        else -> "Не нашёл переключатель качества — выберите вручную"
++                    }
++                    runOnUiThread { Toast.makeText(this@OkkoWebActivity, text, Toast.LENGTH_SHORT).show() }
+                 }
+                 return true
+             }
+@@ -467,6 +491,15 @@ class OkkoWebActivity : Activity() {
+         return path.endsWith(".m3u8") || path.endsWith(".mpd")
+     }
+ 
++    /** Зелёная кнопка «✓ Только звук» — режим активен; повторное нажатие выключает его. */
++    private fun updateAudioOnlyButton() {
++        if (!::audioOnlyButton.isInitialized) return
++        audioOnlyButton.setBackgroundColor(if (webAudioBackgroundEnabled) BTN_AUDIO_ACTIVE else BTN_IDLE)
++        audioOnlyButton.text = if (webAudioBackgroundEnabled) "✓ Только звук" else "♫ Только звук"
++        audioOnlyButton.contentDescription =
++            if (webAudioBackgroundEnabled) "Выйти из режима «только звук»" else "Продолжить звук в фоне"
++    }
++
+     private fun updatePlayerButton() {
+         val found = manifestSnapshot().isNotEmpty()
+         playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
+@@ -476,73 +509,20 @@ class OkkoWebActivity : Activity() {
+      * останавливают декодирование, если video становится 1x1, уходит за экран или скрывается. */
+     private fun toggleWebAudioBackground() {
+         if (!webAudioBackgroundEnabled) {
++            // Android 13+: без разрешения уведомление сервиса не покажется.
++            if (android.os.Build.VERSION.SDK_INT >= 33 &&
++                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
++                android.content.pm.PackageManager.PERMISSION_GRANTED
++            ) {
++                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 4102)
++            }
+             webAudioBackgroundEnabled = true
++            updateAudioOnlyButton()
+             // Keep the original WebView media element and stream. Some sites pause
+             // HTML media on visibilitychange/page hide; while the user explicitly
+             // enabled background audio, retry playback only if it was already playing.
+-            webView.evaluateJavascript(
+-                """
+-                (function() {
+-                  window.__okkoBackgroundAudio = true;
+-                  function report(v, eventName) {
+-                    try { console.log('OKKO_BG_AUDIO:event=' + eventName +
+-                      ',tag=' + v.tagName + ',paused=' + v.paused + ',ended=' + v.ended +
+-                      ',readyState=' + v.readyState + ',networkState=' + v.networkState +
+-                      ',currentTime=' + Math.round(v.currentTime) + ',error=' + (v.error ? v.error.code : 0) +
+-                      ',hidden=' + document.hidden); } catch (_) {}
+-                  }
+-                  console.log('OKKO_BG_AUDIO:enabled hidden=' + document.hidden +
+-                    ' url=' + location.href + ' mediaCount=' + document.querySelectorAll('video,audio').length);
+-                  function attach(v) {
+-                    if (v.__okkoBgAudioAttached) return;
+-                    v.__okkoBgAudioAttached = true;
+-                    v.__okkoBgWasPlaying = !v.paused && !v.ended;
+-                    ['play','playing','pause','waiting','stalled','suspend','ended','error','emptied','abort'].forEach(function(name) {
+-                      v.addEventListener(name, function() { report(v, name); }, true);
+-                    });
+-                    v.addEventListener('play', function() { v.__okkoBgWasPlaying = true; }, true);
+-                    v.addEventListener('playing', function() { v.__okkoBgWasPlaying = true; }, true);
+-                    v.addEventListener('pause', function() {
+-                      if (!window.__okkoBackgroundAudio || !document.hidden ||
+-                          !v.__okkoBgWasPlaying || v.ended) return;
+-                      // Defer until the site's pause handler has completed.
+-                      Promise.resolve().then(function() {
+-                        if (window.__okkoBackgroundAudio && document.hidden &&
+-                            v.__okkoBgWasPlaying && !v.ended) {
+-                          var p = v.play();
+-                          if (p && p.catch) p.catch(function() {});
+-                        }
+-                      });
+-                    }, true);
+-                    if (!v.hasAttribute('data-okko-original-style')) {
+-                      v.setAttribute('data-okko-original-style', v.getAttribute('style') || '');
+-                    }
+-                    // Hide pixels without removing the media element or changing its layout.
+-                    v.style.setProperty('opacity', '0.01', 'important');
+-                  }
+-                  document.querySelectorAll('video,audio').forEach(attach);
+-                  if (!window.__okkoBgAudioObserver) {
+-                    window.__okkoBgAudioObserver = new MutationObserver(function() {
+-                      document.querySelectorAll('video,audio').forEach(attach);
+-                    });
+-                    window.__okkoBgAudioObserver.observe(document.documentElement,
+-                      {childList:true, subtree:true});
+-                  }
+-                  document.addEventListener('visibilitychange', function() {
+-                    console.log('OKKO_BG_AUDIO:visibility hidden=' + document.hidden +
+-                      ' mediaCount=' + document.querySelectorAll('video,audio').length);
+-                    if (!window.__okkoBackgroundAudio || !document.hidden) return;
+-                    document.querySelectorAll('video,audio').forEach(function(v) {
+-                      if (v.__okkoBgWasPlaying && v.paused && !v.ended) {
+-                        var p = v.play(); if (p && p.catch) p.catch(function(){});
+-                      }
+-                    });
+-                  });
+-                  return true;
+-                })()
+-                """.trimIndent(),
+-                null
+-            )
++            webView.keepVisible = KEEP_PAGE_VISIBLE
++            webView.evaluateJavascript(BackgroundJs.ENABLE, null)
+             // Keep the fullscreen custom view fully opaque and attached. The Activity is
+             // moved behind other tasks, so its pixels are not visible to the user anyway;
+             // lowering alpha can let the compositor treat the video surface as transparent.
+@@ -551,31 +531,28 @@ class OkkoWebActivity : Activity() {
+                     .putExtra("web_audio_mode", true)
+                 if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
+                 Toast.makeText(this, "Режим звука включён. Для полного выключения дисплея нажмите кнопку питания.", Toast.LENGTH_LONG).show()
+-                moveTaskToBack(true)
++                if (LOWER_QUALITY_FOR_AUDIO) {
++                    // Даём плееру время переключить качество, потом сворачиваемся.
++                    webView.evaluateJavascript(QualityJs.lowest(), null)
++                    webView.postDelayed({
++                        if (webAudioBackgroundEnabled && !isFinishing) moveTaskToBack(true)
++                    }, QUALITY_STEP_DELAY_MS)
++                } else {
++                    moveTaskToBack(true)
++                }
+             } catch (t: Throwable) {
+                 webAudioBackgroundEnabled = false
+-                webView.evaluateJavascript(
+-                    "window.__okkoBackgroundAudio=false;" +
+-                        "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
+-                        "(function(){document.querySelectorAll('[data-okko-original-style]').forEach(function(v){" +
+-                        "var s=v.getAttribute('data-okko-original-style');" +
+-                        "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
+-                        "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
+-                    null
+-                )
++                updateAudioOnlyButton()
++                webView.keepVisible = false
++                webView.evaluateJavascript(BackgroundJs.DISABLE, null)
+                 Toast.makeText(this, "Не удалось включить фон: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+             }
+         } else {
+             webAudioBackgroundEnabled = false
+-            webView.evaluateJavascript(
+-                "window.__okkoBackgroundAudio=false;" +
+-                    "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
+-                    "(function(){document.querySelectorAll('[data-okko-original-style]').forEach(function(v){" +
+-                    "var s=v.getAttribute('data-okko-original-style');" +
+-                    "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
+-                    "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
+-                null
+-            )
++            updateAudioOnlyButton()
++            webView.keepVisible = false
++            webView.evaluateJavascript(BackgroundJs.DISABLE, null)
++            if (LOWER_QUALITY_FOR_AUDIO) webView.evaluateJavascript(QualityJs.auto(), null)
+             stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
+             Toast.makeText(this, "Фоновый режим выключен", Toast.LENGTH_SHORT).show()
+         }
+@@ -771,7 +748,11 @@ class OkkoWebActivity : Activity() {
+     override fun onDestroy() {
+         android.util.Log.i("OkkoWebAudio", "Activity onDestroy; backgroundMode=$webAudioBackgroundEnabled")
+         if (::volumeSwipe.isInitialized) volumeSwipe.release()
++        if (webAudioBackgroundEnabled) {
++            stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
++        }
+         if (::webView.isInitialized) {
++            webView.keepVisible = false
+             webView.stopLoading()
+             webView.destroy()
+         }
+diff --git a/app/src/main/java/ru/example/okko/PageTweaks.kt b/app/src/main/java/ru/example/okko/PageTweaks.kt
+new file mode 100644
+index 0000000..8262093
+--- /dev/null
++++ b/app/src/main/java/ru/example/okko/PageTweaks.kt
+@@ -0,0 +1,76 @@
++package ru.example.okko
++
++/** Правки внешнего вида страницы okko внутри WebView. */
++internal object PageTweaks {
++
++    /**
++     * Скрывает плашку «Открыть в приложении», которую рисует сама страница.
++     * Ищет текстовый узел с этой фразой, поднимается до fixed/sticky-контейнера
++     * (сама плашка) и прячет его.
++     *
++     * Нагрузка сведена к минимуму: следим только за добавлением узлов (без characterData,
++     * чтобы счётчики времени не вызывали проверок), проверяем только добавленные поддеревья,
++     * не чаще раза в 1,5 с, и не работаем, пока включён режим «Только звук».
++     */
++    const val HIDE_OPEN_IN_APP = """
++(function() {
++  if (window.__okkoBannerKiller) return;
++  window.__okkoBannerKiller = true;
++  var re = /открыть\s+в\s+приложени/i;
++  var DELAY = 1500;
++  var timer = null;
++  var pending = [];
++
++  function hideFor(node) {
++    var el = node.parentElement;
++    var target = null;
++    for (var cur = el, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
++      var pos = '';
++      try { pos = getComputedStyle(cur).position; } catch (_) {}
++      if (pos === 'fixed' || pos === 'sticky') { target = cur; break; }
++    }
++    if (!target) target = (el && el.closest('a,button')) || el;
++    if (target && target.style.display !== 'none') {
++      target.style.setProperty('display', 'none', 'important');
++    }
++  }
++
++  function checkText(n) {
++    var v = n.nodeValue;
++    if (v && v.length < 80 && re.test(v)) hideFor(n);
++  }
++
++  function scanNode(root) {
++    if (!root || !root.isConnected) return;
++    if (root.nodeType === 3) { checkText(root); return; }
++    if (root.nodeType !== 1) return;
++    var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
++    var n;
++    while ((n = w.nextNode())) checkText(n);
++  }
++
++  function flush() {
++    timer = null;
++    var nodes = pending;
++    pending = [];
++    // В режиме «Только звук» страницу никто не видит — не тратим процессор.
++    if (window.__okkoBackgroundAudio) return;
++    for (var i = 0; i < nodes.length; i++) scanNode(nodes[i]);
++  }
++
++  function schedule() { if (!timer) timer = setTimeout(flush, DELAY); }
++
++  new MutationObserver(function(records) {
++    for (var i = 0; i < records.length; i++) {
++      var added = records[i].addedNodes;
++      for (var j = 0; j < added.length; j++) pending.push(added[j]);
++    }
++    if (pending.length > 200) pending = [document.body || document.documentElement];
++    schedule();
++  }).observe(document.documentElement, {childList: true, subtree: true});
++
++  pending.push(document.documentElement);
++  schedule();
++})()
++"""
++}
+diff --git a/app/src/main/java/ru/example/okko/PlaybackForegroundService.kt b/app/src/main/java/ru/example/okko/PlaybackForegroundService.kt
+index 3b2a630..15eab38 100644
+--- a/app/src/main/java/ru/example/okko/PlaybackForegroundService.kt
++++ b/app/src/main/java/ru/example/okko/PlaybackForegroundService.kt
+@@ -5,6 +5,7 @@ import android.app.NotificationChannel
+ import android.app.NotificationManager
+ import android.app.PendingIntent
+ import android.app.Service
++import android.net.wifi.WifiManager
+ import android.os.PowerManager
+ import android.content.Intent
+ import android.os.Build
+@@ -26,6 +27,7 @@ class PlaybackForegroundService : Service() {
+     private var activePlayer: ExoPlayer? = null
+     private var webAudioMode = false
+     private var wakeLock: PowerManager.WakeLock? = null
++    private var wifiLock: WifiManager.WifiLock? = null
+ 
+     override fun onCreate() {
+         super.onCreate()
+@@ -58,6 +60,16 @@ class PlaybackForegroundService : Service() {
+                 ).apply { setReferenceCounted(false) }
+             }
+             if (wakeLock?.isHeld != true) wakeLock?.acquire()
++            // Чтобы Wi-Fi не засыпал вместе с экраном и поток не прерывался.
++            if (wifiLock == null) {
++                val wifi = applicationContext.getSystemService(WifiManager::class.java)
++                @Suppress("DEPRECATION")
++                wifiLock = wifi?.createWifiLock(
++                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
++                    "$packageName:WebViewAudio"
++                )?.apply { setReferenceCounted(false) }
++            }
++            if (wifiLock?.isHeld != true) wifiLock?.acquire()
+         } else {
+             releaseWebAudioResources()
+         }
+@@ -95,6 +107,8 @@ class PlaybackForegroundService : Service() {
+     private fun releaseWebAudioResources() {
+         wakeLock?.let { if (it.isHeld) it.release() }
+         wakeLock = null
++        wifiLock?.let { if (it.isHeld) it.release() }
++        wifiLock = null
+     }
+ 
+     override fun onDestroy() {
+diff --git a/app/src/main/java/ru/example/okko/QualityJs.kt b/app/src/main/java/ru/example/okko/QualityJs.kt
+new file mode 100644
+index 0000000..2b95c35
+--- /dev/null
++++ b/app/src/main/java/ru/example/okko/QualityJs.kt
+@@ -0,0 +1,127 @@
++package ru.example.okko
++
++/**
++ * Эвристическое переключение качества в веб-плеере okko: открывает меню настроек плеера,
++ * заходит в «Качество» (если оно вложенное) и выбирает самое низкое разрешение
++ * (mode = 'low') либо «Авто» (mode = 'auto'). Вёрстка okko заранее неизвестна, поэтому
++ * элементы ищутся по подписям/тексту. Результат — сообщение в консоль «OKKO_QUALITY:...».
++ */
++internal object QualityJs {
++
++    private const val BODY = """
++function(mode) {
++  var RES = /(^|\D)(144|240|360|480|540|576|720|1080|1440|2160)p?(\D|${'$'})/i;
++  var done = false;
++  function say(m) { if (done) return; done = true; console.log('OKKO_QUALITY:' + m); }
++  function txt(el) { return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
++  function vis(el) { var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
++
++  function click(el) {
++    var t = el;
++    for (var i = 0; i < 4 && t; i++, t = t.parentElement) {
++      var tag = (t.tagName || '').toLowerCase();
++      if (tag === 'button' || tag === 'li' || t.getAttribute('role')) { el = t; break; }
++    }
++    try {
++      ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(function(n) {
++        var C = (n.indexOf('pointer') === 0 && window.PointerEvent) ? PointerEvent : MouseEvent;
++        el.dispatchEvent(new C(n, {bubbles: true, cancelable: true, view: window}));
++      });
++    } catch (_) {}
++    el.click();
++  }
++
++  function wake() {
++    var v = document.querySelector('video');
++    var t = (v && v.parentElement) || document.body;
++    ['pointermove', 'mousemove', 'mouseover'].forEach(function(n) {
++      try { t.dispatchEvent(new MouseEvent(n, {bubbles: true, view: window, clientX: 50, clientY: 50})); } catch (_) {}
++    });
++  }
++
++  function findSettings() {
++    var list = document.querySelectorAll(
++      'button,[role=button],[aria-label],[title],[class*=setting],[class*=quality],[class*=gear]');
++    for (var i = 0; i < list.length; i++) {
++      var e = list[i];
++      var cls = (typeof e.className === 'string') ? e.className : '';
++      var label = (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('title') || '') + ' ' +
++        cls + ' ' + txt(e).slice(0, 30);
++      if (/качеств|quality|настройк|setting|gear/i.test(label) && vis(e) && !e.closest('a[href]')) return e;
++    }
++    return null;
++  }
++
++  // Самые «глубокие» видимые элементы с коротким текстом, подходящим под re.
++  function leafs(re) {
++    var out = [];
++    var all = document.querySelectorAll('li,button,span,div,p,[role=menuitem],[role=option],[role=radio]');
++    for (var i = 0; i < all.length; i++) {
++      var e = all[i];
++      var t = txt(e);
++      if (!t || t.length > 30 || !re.test(t) || !vis(e) || e.closest('a[href]')) continue;
++      var deeper = false;
++      for (var c = e.firstElementChild; c; c = c.nextElementSibling) {
++        var ct = txt(c);
++        if (ct && re.test(ct)) { deeper = true; break; }
++      }
++      if (!deeper) out.push({el: e, text: t});
++    }
++    return out;
++  }
++
++  function resNum(t) { var m = RES.exec(t); return m ? parseInt(m[2], 10) : 0; }
++
++  function options() {
++    if (mode === 'auto') return leafs(/^(авто|auto)/i);
++    var r = leafs(RES).filter(function(o) { return resNum(o.text) > 0; });
++    if (r.length) return r;
++    return leafs(/низк|^low|^sd\b/i);
++  }
++
++  function pick(opts) {
++    var best = opts[0];
++    if (mode !== 'auto') {
++      for (var i = 1; i < opts.length; i++) {
++        var a = resNum(opts[i].text), b = resNum(best.text);
++        if (a > 0 && (b === 0 || a < b)) best = opts[i];
++      }
++    }
++    click(best.el);
++    say('ok ' + (mode === 'auto' ? 'auto' : 'low ' + best.text));
++    // Если меню не закрылось само — закрываем Escape.
++    setTimeout(function() {
++      if (options().length) {
++        ['keydown', 'keyup'].forEach(function(n) {
++          document.dispatchEvent(new KeyboardEvent(n, {key: 'Escape', keyCode: 27, bubbles: true}));
++        });
++      }
++    }, 600);
++  }
++
++  wake();
++  setTimeout(function() {
++    var s = findSettings();
++    if (!s) { say('fail no-settings'); return; }
++    click(s);
++    setTimeout(function() {
++      var o = options();
++      if (o.length) { pick(o); return; }
++      var q = leafs(/качеств|quality|разрешен|resolution/i)[0];
++      if (!q) { say('fail no-options'); return; }
++      click(q.el);
++      setTimeout(function() {
++        var o2 = options();
++        if (o2.length) pick(o2); else say('fail no-options');
++      }, 700);
++    }, 700);
++  }, 300);
++}
++"""
++
++    /** Выбрать самое низкое качество. */
++    fun lowest(): String = "($BODY)('low')"
++
++    /** Вернуть «Авто». */
++    fun auto(): String = "($BODY)('auto')"
++}
