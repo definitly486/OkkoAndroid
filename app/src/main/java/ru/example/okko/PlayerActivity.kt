@@ -53,6 +53,8 @@ class PlayerActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var playerView: PlayerView
     private var player: ExoPlayer? = null
+    private var resumeOnStart = false
+    private var liveWindowRetries = 0
 
     // Элементы, нужные для переключения полноэкранного режима.
     private lateinit var rootFrame: FrameLayout
@@ -297,8 +299,13 @@ class PlayerActivity : Activity() {
             } else {
                 "Подключение к потоку и запрос лицензии Widevine…"
             }
+            liveWindowRetries = 0
             val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
             if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
+            // Для прямых эфиров (HLS live): небольшое ускорение, чтобы догонять «живой» край.
+            itemBuilder.setLiveConfiguration(
+                MediaItem.LiveConfiguration.Builder().setMaxPlaybackSpeed(1.04f).build()
+            )
             val dataSourceFactory = DefaultHttpDataSource.Factory()
                 .setAllowCrossProtocolRedirects(true)
                 .apply {
@@ -321,6 +328,17 @@ class PlayerActivity : Activity() {
                 }
                 override fun onPlayerError(error: PlaybackException) {
                     Log.e(LOG_TAG, "Ошибка воспроизведения", error)
+                    // Позиция вышла за окно прямого эфира (окно ~30 с): возвращаемся к «живому» краю.
+                    if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW &&
+                        liveWindowRetries < 3
+                    ) {
+                        liveWindowRetries++
+                        status.text = "Эфир ушёл вперёд, переподключение…"
+                        exo.seekToDefaultPosition()
+                        exo.prepare()
+                        exo.playWhenReady = true
+                        return
+                    }
                     status.text = explainPlaybackError(error)
                 }
             })
@@ -394,8 +412,20 @@ class PlayerActivity : Activity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
+    override fun onStart() {
+        super.onStart()
+        val exo = player
+        if (exo != null && resumeOnStart) {
+            resumeOnStart = false
+            // Для прямого эфира после паузы возвращаемся к живому краю, иначе окно может уйти.
+            if (exo.isCurrentMediaItemLive) exo.seekToDefaultPosition()
+            exo.play()
+        }
+    }
+
     override fun onStop() {
         super.onStop()
+        resumeOnStart = player?.playWhenReady == true
         player?.pause()
     }
 
