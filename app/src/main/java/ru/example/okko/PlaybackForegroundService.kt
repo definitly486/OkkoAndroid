@@ -5,6 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.PowerManager
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
@@ -24,6 +28,9 @@ class PlaybackForegroundService : Service() {
 
     private var activePlayer: ExoPlayer? = null
     private var webAudioMode = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -43,6 +50,22 @@ class PlaybackForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         activePlayer = PlaybackHolder.player
         webAudioMode = intent?.getBooleanExtra("web_audio_mode", false) == true
+
+        // Keep the WebView renderer's process/CPU alive while the foreground audio
+        // mode is active. This does not replace the WebView player or touch its stream.
+        if (webAudioMode) {
+            if (wakeLock == null) {
+                val powerManager = getSystemService(PowerManager::class.java)
+                wakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "$packageName:WebViewAudio"
+                ).apply { setReferenceCounted(false) }
+            }
+            if (wakeLock?.isHeld != true) wakeLock?.acquire()
+            requestWebAudioFocus()
+        } else {
+            releaseWebAudioResources()
+        }
         val targetActivity = if (webAudioMode) OkkoWebActivity::class.java else PlayerActivity::class.java
         val openPlayer = PendingIntent.getActivity(
             this,
@@ -73,7 +96,47 @@ class PlaybackForegroundService : Service() {
         return START_STICKY
     }
 
+    private fun requestWebAudioFocus() {
+        val manager = getSystemService(AudioManager::class.java)
+        audioManager = manager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener { /* WebView owns playback; do not restart or seek it. */ }
+                .setWillPauseWhenDucked(false)
+                .build()
+            audioFocusRequest = request
+            manager.requestAudioFocus(request)
+        } else {
+            @Suppress("DEPRECATION")
+            manager.requestAudioFocus(
+                null,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+    }
+
+    private fun releaseWebAudioResources() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager?.abandonAudioFocus(null)
+        }
+        audioFocusRequest = null
+        audioManager = null
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+    }
+
     override fun onDestroy() {
+        releaseWebAudioResources()
         activePlayer = null
         super.onDestroy()
     }
