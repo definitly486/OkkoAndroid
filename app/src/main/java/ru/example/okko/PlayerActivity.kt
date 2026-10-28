@@ -66,6 +66,12 @@ class PlayerActivity : Activity() {
     private var videoInfo = ""
     private var liveWindowRetries = 0
 
+    // Экран открыт из WebView (передан манифест) — тогда для зашифрованного потока возвращаемся на страницу.
+    private var launchedFromWebView = false
+    // Итоговое объяснение, почему нет картинки; не даём ему затираться общими статусами плеера.
+    private var blockedMessage: String? = null
+    private lateinit var backToPageButton: Button
+
     // Элементы, нужные для переключения полноэкранного режима.
     private lateinit var rootFrame: FrameLayout
     private lateinit var mainColumn: LinearLayout
@@ -93,6 +99,7 @@ class PlayerActivity : Activity() {
         userAgent = intent.getStringExtra(EXTRA_USER_AGENT)
         intent.getStringExtra(EXTRA_COOKIE)?.takeIf { it.isNotBlank() }?.let { httpHeaders["Cookie"] = it }
         intent.getStringExtra(EXTRA_REFERER)?.takeIf { it.isNotBlank() }?.let { httpHeaders["Referer"] = it }
+        launchedFromWebView = stream.isNotBlank()
         if (stream.isNotBlank()) {
             streamInput.setText(stream)
             if (license.isNotBlank()) {
@@ -187,6 +194,10 @@ class PlayerActivity : Activity() {
         }, matchWrap())
         body.addView(space(12))
         body.addView(label("Примечание: кнопка «Плеер» на экране Okko открывает этот экран, но не передаёт автоматически фильм из каталога. Для такой интеграции требуется официальный интерфейс воспроизведения Okko.", 12f, muted))
+        body.addView(space(12))
+        backToPageButton = button("Вернуться к странице (смотреть в WebView)", true) { finish() }
+        backToPageButton.visibility = View.GONE
+        body.addView(backToPageButton, matchWrap())
         body.addView(space(12))
         body.addView(label("Диагностика", 16f, fg, true))
         status = label("Проверка…", 13f, muted)
@@ -327,6 +338,8 @@ class PlayerActivity : Activity() {
             liveWindowRetries = 0
             firstFrameRendered = false
             videoInfo = ""
+            blockedMessage = null
+            backToPageButton.visibility = View.GONE
             val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
             if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
             // Для прямых эфиров (HLS live): небольшое ускорение, чтобы догонять «живой» край.
@@ -349,14 +362,16 @@ class PlayerActivity : Activity() {
             exo.addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     when (playbackState) {
-                        Player.STATE_BUFFERING -> status.text = "Буферизация: ожидание видео или ответа DRM-лицензии…"
+                        Player.STATE_BUFFERING ->
+                            status.text = blockedMessage ?: "Буферизация: ожидание видео или ответа DRM-лицензии…"
                         Player.STATE_READY -> {
-                            status.text = "Плеер готов."
+                            status.text = blockedMessage ?: "Плеер готов."
                             // Если через 4 с кадры так и не появились — показываем, что за видеодорожки в потоке.
                             uiHandler.postDelayed({
                                 if (player === exo && !firstFrameRendered && exo.playWhenReady) {
-                                    status.text = "Плеер готов, но кадры не отрисованы.\n" +
-                                        videoInfo.ifBlank { "Сведений о видеодорожках нет." }
+                                    status.text = blockedMessage
+                                        ?: ("Плеер готов, но кадры не отрисованы.\n" +
+                                            videoInfo.ifBlank { "Сведений о видеодорожках нет." })
                                 }
                             }, 4000)
                         }
@@ -398,18 +413,33 @@ class PlayerActivity : Activity() {
                     val anySupportedVideo = tracks.groups.any { g ->
                         g.type == C.TRACK_TYPE_VIDEO && (0 until g.length).any { i -> g.isTrackSupported(i) }
                     }
-                    if (!anySupportedVideo) {
-                        val codecs = runCatching { codecDiagnostics() }
-                            .getOrElse { "Список кодеков недоступен: ${it.javaClass.simpleName}: ${it.message}" }
-                        Log.d(LOG_TAG, codecs)
+                    if (hasVideo && !anySupportedVideo) {
                         val encrypted = tracks.groups.any { g ->
                             g.type == C.TRACK_TYPE_VIDEO &&
                                 (0 until g.length).any { i -> g.getTrackFormat(i).drmInitData != null }
                         }
-                        val hint = if (encrypted && licenseInput.text.isBlank()) {
-                            "Поток зашифрован, а URL лицензии не задан: без DRM-конфигурации видео не воспроизводится.\n\n"
-                        } else ""
-                        status.text = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$hint$videoInfo\n\n$codecs"
+                        val message: String
+                        if (encrypted && licenseInput.text.isBlank()) {
+                            // Поток зашифрован, а DRM не настроен: ни видео, ни звук воспроизвести нельзя.
+                            message = "Поток зашифрован (DRM), а URL лицензии не задан: встроенный плеер " +
+                                "не может воспроизвести ни видео, ни звук. Смотрите видео на странице (WebView).\n\n$videoInfo"
+                            backToPageButton.visibility = View.VISIBLE
+                            if (launchedFromWebView) {
+                                Toast.makeText(
+                                    this@PlayerActivity,
+                                    "Поток зашифрован (DRM): возвращаюсь к странице, смотрите видео там.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                finish()
+                            }
+                        } else {
+                            val codecs = runCatching { codecDiagnostics() }
+                                .getOrElse { "Список кодеков недоступен: ${it.javaClass.simpleName}: ${it.message}" }
+                            Log.d(LOG_TAG, codecs)
+                            message = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$videoInfo\n\n$codecs"
+                        }
+                        blockedMessage = message
+                        status.text = message
                     }
                 }
 

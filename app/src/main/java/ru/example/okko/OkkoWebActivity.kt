@@ -29,6 +29,7 @@ class OkkoWebActivity : Activity() {
 
         private const val BG = 0xFF0C0D12.toInt()
         private const val ACCENT = 0xFFFF486E.toInt()
+        private const val MAX_MANIFESTS = 12
     }
 
     private lateinit var webView: WebView
@@ -41,7 +42,22 @@ class OkkoWebActivity : Activity() {
     private lateinit var playerButton: TextView
 
     // Последний HLS/DASH-манифест, который страница сама запросила в WebView.
-    @Volatile private var detectedStreamUrl: String? = null
+    // Запоминаем несколько последних манифестов (свежие — в конце): у страницы их бывает
+    // несколько (DASH и HLS, мастер и медиа-плейлисты), а годится для встроенного плеера
+    // не любой. Доступ из разных потоков — только через rememberManifest/clearManifests/manifestSnapshot.
+    private val detectedManifests = ArrayList<String>()
+
+    private fun rememberManifest(url: String): Boolean = synchronized(detectedManifests) {
+        val isNew = !detectedManifests.contains(url)
+        detectedManifests.remove(url)
+        detectedManifests.add(url)
+        while (detectedManifests.size > MAX_MANIFESTS) detectedManifests.removeAt(0)
+        isNew
+    }
+
+    private fun clearManifests() = synchronized(detectedManifests) { detectedManifests.clear() }
+
+    private fun manifestSnapshot(): List<String> = synchronized(detectedManifests) { detectedManifests.toList() }
 
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
@@ -183,7 +199,7 @@ class OkkoWebActivity : Activity() {
                 favicon: android.graphics.Bitmap?
             ) {
                 progress.visibility = View.VISIBLE
-                detectedStreamUrl = null
+                clearManifests()
                 updatePlayerButton()
             }
 
@@ -194,9 +210,8 @@ class OkkoWebActivity : Activity() {
                 request: WebResourceRequest?
             ): WebResourceResponse? {
                 val url = request?.url?.toString()
-                if (url != null && isManifestUrl(url) && url != detectedStreamUrl) {
-                    detectedStreamUrl = url
-                    runOnUiThread { updatePlayerButton() }
+                if (url != null && isManifestUrl(url)) {
+                    if (rememberManifest(url)) runOnUiThread { updatePlayerButton() }
                 }
                 return null
             }
@@ -353,33 +368,133 @@ class OkkoWebActivity : Activity() {
     }
 
     private fun updatePlayerButton() {
-        val found = detectedStreamUrl != null
+        val found = manifestSnapshot().isNotEmpty()
         playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
     }
 
-    /** Передаёт найденный манифест во встроенный Media3-плеер вместе с UA/cookies/Referer сессии. */
-    private fun openInNativePlayer() {
-        val stream = detectedStreamUrl
-        val intent = android.content.Intent(this, PlayerActivity::class.java)
-        if (stream == null) {
-            Toast.makeText(
-                this,
-                "Поток не обнаружен: запустите видео на странице",
-                Toast.LENGTH_SHORT
-            ).show()
-        } else {
-            intent.putExtra(PlayerActivity.EXTRA_STREAM_URL, stream)
-            intent.putExtra(PlayerActivity.EXTRA_USER_AGENT, webView.settings.userAgentString)
-            intent.putExtra(PlayerActivity.EXTRA_REFERER, webView.url)
-            CookieManager.getInstance().getCookie(stream)?.let {
-                intent.putExtra(PlayerActivity.EXTRA_COOKIE, it)
+    /** Результат разбора манифеста. null = определить не удалось. */
+    private class ManifestInfo(
+        val url: String,
+        /** true — поток зашифрован (ContentProtection / EXT-X-KEY), false — нет. */
+        val encrypted: Boolean?,
+        /** true — полный манифест (MPD или HLS master), false — медиа-плейлист одной дорожки. */
+        val master: Boolean?
+    )
+
+    /**
+     * Скачивает начало манифеста (с теми же UA/Referer/cookies, что у страницы) и определяет,
+     * зашифрован ли он и является ли он полным манифестом. Ключи и лицензии не запрашиваются.
+     */
+    private fun inspectManifest(url: String, userAgent: String, referer: String?): ManifestInfo {
+        var conn: java.net.HttpURLConnection? = null
+        try {
+            val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn = c
+            c.connectTimeout = 5000
+            c.readTimeout = 5000
+            c.setRequestProperty("User-Agent", userAgent)
+            if (!referer.isNullOrBlank()) c.setRequestProperty("Referer", referer)
+            CookieManager.getInstance().getCookie(url)?.let { c.setRequestProperty("Cookie", it) }
+            if (c.responseCode !in 200..299) return ManifestInfo(url, null, null)
+            val text = c.inputStream.use { stream ->
+                val buf = ByteArray(256 * 1024)
+                var n = 0
+                while (n < buf.size) {
+                    val r = stream.read(buf, n, buf.size - n)
+                    if (r < 0) break
+                    n += r
+                }
+                String(buf, 0, n, Charsets.UTF_8)
             }
-            // Чтобы звук из страницы не играл параллельно с нативным плеером.
-            webView.evaluateJavascript(
-                "document.querySelectorAll('video,audio').forEach(function(m){m.pause()})",
-                null
-            )
+            return when {
+                text.contains("<MPD", ignoreCase = true) ->
+                    ManifestInfo(url, text.contains("ContentProtection", ignoreCase = true), true)
+                text.contains("#EXTM3U") -> {
+                    val master = text.contains("#EXT-X-STREAM-INF")
+                    val keyed = Regex("#EXT-X-(SESSION-)?KEY:[^\\n]*METHOD=(?!NONE)").containsMatchIn(text)
+                    // У HLS-мастера ключей обычно нет: шифрование видно только в медиа-плейлисте.
+                    val encrypted = if (keyed) true else if (master) null else false
+                    ManifestInfo(url, encrypted, master)
+                }
+                else -> ManifestInfo(url, null, null)
+            }
+        } catch (t: Throwable) {
+            return ManifestInfo(url, null, null)
+        } finally {
+            conn?.disconnect()
         }
+    }
+
+    /**
+     * Выбирает манифест для встроенного плеера: сначала незашифрованные, потом неизвестные,
+     * зашифрованные — в последнюю очередь; среди равных — полные манифесты и более свежие.
+     */
+    private fun pickBestManifest(candidates: List<String>, userAgent: String, referer: String?): ManifestInfo? {
+        if (candidates.isEmpty()) return null
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+        try {
+            val futures = candidates.map { u ->
+                pool.submit(java.util.concurrent.Callable { inspectManifest(u, userAgent, referer) })
+            }
+            val infos = futures.mapIndexed { idx, f ->
+                runCatching { f.get(8, java.util.concurrent.TimeUnit.SECONDS) }
+                    .getOrElse { ManifestInfo(candidates[idx], null, null) }
+            }
+            // candidates: свежие в конце, сортировка стабильная — разворачиваем, чтобы свежие были первыми.
+            return infos.reversed().sortedWith(
+                compareBy<ManifestInfo>(
+                    { when (it.encrypted) { false -> 0; null -> 1; true -> 2 } },
+                    { if (it.master == false) 1 else 0 }
+                )
+            ).first()
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    /** Открывает встроенный Media3-плеер для найденного манифеста (с UA/cookies/Referer сессии). */
+    private fun openInNativePlayer() {
+        val candidates = manifestSnapshot()
+        if (candidates.isEmpty()) {
+            Toast.makeText(this, "Поток не обнаружен: запустите видео на странице", Toast.LENGTH_SHORT).show()
+            startActivity(android.content.Intent(this, PlayerActivity::class.java))
+            return
+        }
+        val userAgent = webView.settings.userAgentString
+        val referer = webView.url
+        playerButton.isEnabled = false
+        Toast.makeText(this, "Проверяю найденные потоки…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val best = pickBestManifest(candidates, userAgent, referer)
+            runOnUiThread {
+                playerButton.isEnabled = true
+                if (isFinishing) return@runOnUiThread
+                if (best == null || best.encrypted == true) {
+                    Toast.makeText(
+                        this,
+                        "Поток зашифрован (DRM): встроенный плеер без лицензии его не покажет. Смотрите видео на странице.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    launchNativePlayer(best.url, userAgent, referer)
+                }
+            }
+        }.start()
+    }
+
+    private fun launchNativePlayer(stream: String, userAgent: String, referer: String?) {
+        val intent = android.content.Intent(this, PlayerActivity::class.java)
+        intent.putExtra(PlayerActivity.EXTRA_STREAM_URL, stream)
+        intent.putExtra(PlayerActivity.EXTRA_USER_AGENT, userAgent)
+        intent.putExtra(PlayerActivity.EXTRA_REFERER, referer)
+        CookieManager.getInstance().getCookie(stream)?.let {
+            intent.putExtra(PlayerActivity.EXTRA_COOKIE, it)
+        }
+        // Чтобы звук из страницы не играл параллельно с нативным плеером.
+        webView.evaluateJavascript(
+            "document.querySelectorAll('video,audio').forEach(function(m){m.pause()})",
+            null
+        )
         startActivity(intent)
     }
 
