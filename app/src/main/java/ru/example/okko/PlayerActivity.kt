@@ -73,6 +73,11 @@ class PlayerActivity : Activity() {
     private var blockedMessage: String? = null
     private lateinit var backToPageButton: Button
     private lateinit var volumeSwipe: VolumeSwipeController
+    private lateinit var backgroundButton: Button
+    private lateinit var audioOnlyButton: Button
+    private lateinit var audioOnlyLabel: TextView
+    private var backgroundPlaybackEnabled = false
+    private var audioOnlyEnabled = false
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (!::volumeSwipe.isInitialized) return super.dispatchTouchEvent(ev)
@@ -96,7 +101,12 @@ class PlayerActivity : Activity() {
         installCrashReporter()
         window.statusBarColor = bg
         window.navigationBarColor = bg
+        backgroundPlaybackEnabled = getSharedPreferences("player_settings", MODE_PRIVATE)
+            .getBoolean("background_playback", false)
+        audioOnlyEnabled = getSharedPreferences("player_settings", MODE_PRIVATE)
+            .getBoolean("audio_only", false)
         buildUi()
+        updatePlaybackButtons()
         // Громкость свайпом по правому краю — в полноэкранном режиме плеера.
         volumeSwipe = VolumeSwipeController(this, rootFrame) { isFullscreen }
         safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
@@ -170,7 +180,29 @@ class PlayerActivity : Activity() {
         playerView.setControllerVisibilityListener(
             PlayerView.ControllerVisibilityListener { visibility -> fullscreenButton.visibility = visibility }
         )
+        audioOnlyLabel = TextView(this).apply {
+            text = "♪  Только звук — видео отключено"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(fg)
+            visibility = View.GONE
+            setBackgroundColor(0xFF101117.toInt())
+        }
+        playerContainer.addView(
+            audioOnlyLabel,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
         body.addView(playerContainer, LinearLayout.LayoutParams(-1, dp(230)))
+        body.addView(space(8))
+        val playbackOptions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        audioOnlyButton = button("Только звук", false) { toggleAudioOnly() }
+        backgroundButton = button("Проигрывать в фоне", false) { toggleBackgroundPlayback() }
+        playbackOptions.addView(audioOnlyButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
+        playbackOptions.addView(backgroundButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
+        body.addView(playbackOptions, matchWrap())
         body.addView(space(16))
         body.addView(label("Источник видео", 16f, fg, true))
         streamInput = edit("", "HTTPS URL потока DASH (.mpd) или HLS (.m3u8)")
@@ -367,7 +399,9 @@ class PlayerActivity : Activity() {
                 .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory))
                 .build()
             player = exo
+            PlaybackHolder.player = exo
             playerView.player = exo
+            applyAudioOnlyMode(exo)
             exo.addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     when (playbackState) {
@@ -644,9 +678,69 @@ class PlayerActivity : Activity() {
     private fun releasePlayer() {
         uiHandler.removeCallbacksAndMessages(null)
         playerView.player = null
-        player?.release()
+        player?.let { current ->
+            if (PlaybackHolder.player === current) PlaybackHolder.player = null
+            current.release()
+        }
         player = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun toggleAudioOnly() {
+        audioOnlyEnabled = !audioOnlyEnabled
+        getSharedPreferences("player_settings", MODE_PRIVATE).edit()
+            .putBoolean("audio_only", audioOnlyEnabled).apply()
+        player?.let { applyAudioOnlyMode(it) }
+        updatePlaybackButtons()
+    }
+
+    private fun applyAudioOnlyMode(exo: ExoPlayer) {
+        exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, audioOnlyEnabled)
+            .build()
+        playerView.videoSurfaceView?.visibility = if (audioOnlyEnabled) View.GONE else View.VISIBLE
+        if (::audioOnlyLabel.isInitialized) {
+            audioOnlyLabel.visibility = if (audioOnlyEnabled) View.VISIBLE else View.GONE
+            audioOnlyLabel.bringToFront()
+            if (::fullscreenButton.isInitialized) fullscreenButton.bringToFront()
+        }
+    }
+
+    private fun toggleBackgroundPlayback() {
+        backgroundPlaybackEnabled = !backgroundPlaybackEnabled
+        getSharedPreferences("player_settings", MODE_PRIVATE).edit()
+            .putBoolean("background_playback", backgroundPlaybackEnabled).apply()
+        if (backgroundPlaybackEnabled) {
+            try {
+                val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
+                Toast.makeText(this, "Фоновое воспроизведение включено", Toast.LENGTH_SHORT).show()
+            } catch (t: Throwable) {
+                backgroundPlaybackEnabled = false
+                getSharedPreferences("player_settings", MODE_PRIVATE).edit()
+                    .putBoolean("background_playback", false).apply()
+                Toast.makeText(this, "Не удалось включить фон: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
+            Toast.makeText(this, "Фоновое воспроизведение выключено", Toast.LENGTH_SHORT).show()
+        }
+        updatePlaybackButtons()
+    }
+
+    private fun updatePlaybackButtons() {
+        if (::backgroundButton.isInitialized) {
+            backgroundButton.text = if (backgroundPlaybackEnabled) "Фон: включён" else "Проигрывать в фоне"
+            backgroundButton.backgroundTintList = android.content.res.ColorStateList.valueOf(
+                if (backgroundPlaybackEnabled) accent else panel
+            )
+        }
+        if (::audioOnlyButton.isInitialized) {
+            audioOnlyButton.text = if (audioOnlyEnabled) "Только звук: вкл." else "Только звук"
+            audioOnlyButton.backgroundTintList = android.content.res.ColorStateList.valueOf(
+                if (audioOnlyEnabled) accent else panel
+            )
+        }
     }
 
     override fun onStart() {
@@ -666,13 +760,22 @@ class PlayerActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
+        if (backgroundPlaybackEnabled && player?.playWhenReady == true) {
+            playerView.player = null
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            return
+        }
         resumeOnStart = player?.playWhenReady == true
         releasePlayer()
     }
 
     override fun onDestroy() {
         if (::volumeSwipe.isInitialized) volumeSwipe.release()
-        releasePlayer()
+        if (backgroundPlaybackEnabled && player?.playWhenReady == true) {
+            playerView.player = null
+        } else {
+            releasePlayer()
+        }
         super.onDestroy()
     }
 
