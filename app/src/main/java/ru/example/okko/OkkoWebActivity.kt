@@ -397,24 +397,22 @@ class OkkoWebActivity : Activity() {
         playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
     }
 
-    /** Скрывает видеоряд WebView, оставляя воспроизведение звука, и удерживает процесс сервисом. */
+    /** Включает фоновый режим, не меняя размеры/позицию видеоповерхности: некоторые web-плееры
+     * останавливают декодирование, если video становится 1x1, уходит за экран или скрывается. */
     private fun toggleWebAudioBackground() {
         if (!webAudioBackgroundEnabled) {
             webAudioBackgroundEnabled = true
-            // Скрываем видеоэлементы и полноэкранную поверхность, не останавливая медиаплеер страницы.
             webView.evaluateJavascript(
                 "(function(){document.querySelectorAll('video').forEach(function(v){" +
                     "if(!v.hasAttribute('data-okko-original-style')){" +
                     "v.setAttribute('data-okko-original-style',v.getAttribute('style')||'');}" +
-                    "v.style.setProperty('opacity','0','important');" +
-                    "v.style.setProperty('width','1px','important');" +
-                    "v.style.setProperty('height','1px','important');" +
-                    "v.style.setProperty('position','fixed','important');" +
-                    "v.style.setProperty('left','-10000px','important');" +
+                    // Сохраняем layout и видимость элемента для движка; скрываем только картинку.
+                    "v.style.setProperty('opacity','0.01','important');" +
                     "});return true;})()",
                 null
             )
-            fullscreenView?.visibility = View.GONE
+            // Не использовать GONE: у SurfaceView/WebView это может остановить видео и звук.
+            fullscreenView?.alpha = 0.01f
             try {
                 val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
                     .putExtra("web_audio_mode", true)
@@ -425,7 +423,14 @@ class OkkoWebActivity : Activity() {
                 moveTaskToBack(true)
             } catch (t: Throwable) {
                 webAudioBackgroundEnabled = false
-                fullscreenView?.visibility = View.VISIBLE
+                fullscreenView?.alpha = 1f
+                webView.evaluateJavascript(
+                    "(function(){document.querySelectorAll('video[data-okko-original-style]').forEach(function(v){" +
+                        "var s=v.getAttribute('data-okko-original-style');" +
+                        "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
+                        "v.removeAttribute('data-okko-original-style');});return true;})()",
+                    null
+                )
                 Toast.makeText(this, "Не удалось включить фон: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
             }
         } else {
@@ -437,7 +442,7 @@ class OkkoWebActivity : Activity() {
                     "v.removeAttribute('data-okko-original-style');});return true;})()",
                 null
             )
-            fullscreenView?.visibility = View.VISIBLE
+            fullscreenView?.alpha = 1f
             stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
             backgroundButton.text = "♫ Фон"
             backgroundButton.setBackgroundColor(0xFF343642.toInt())
