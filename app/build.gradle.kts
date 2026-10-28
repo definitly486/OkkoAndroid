@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "ru.example.okko"
-    compileSdk = 35
+    compileSdk = 36
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
