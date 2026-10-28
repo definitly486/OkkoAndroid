@@ -3,12 +3,15 @@ package ru.example.okko
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.PictureInPictureParams
 import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.content.res.Configuration
+import android.util.Rational
 import android.webkit.CookieManager
 import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
@@ -47,6 +50,7 @@ class OkkoWebActivity : Activity() {
     private lateinit var playerButton: TextView
     private lateinit var backgroundButton: TextView
     private var webAudioBackgroundEnabled = false
+    private var inPictureInPicture = false
 
     // Последний HLS/DASH-манифест, который страница сама запросила в WebView.
     // Запоминаем несколько последних манифестов (свежие — в конце): у страницы их бывает
@@ -131,8 +135,8 @@ class OkkoWebActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(dp(10), dp(8), dp(10), dp(8))
             setBackgroundColor(0xFF343642.toInt())
-            contentDescription = "Проигрывать только звук в фоне"
-            setOnClickListener { toggleWebAudioBackground() }
+            contentDescription = "Открыть видео в маленьком плавающем окне"
+            setOnClickListener { enterMiniPlayer() }
         }
         val backgroundButtonContainer = LinearLayout(this).apply {
             gravity = Gravity.CENTER
@@ -392,6 +396,48 @@ class OkkoWebActivity : Activity() {
                 ?: "https://okko.tv/"
 
             webView.loadUrl(url)
+        }
+    }
+
+    /** Открывает текущий экран WebView в системном плавающем окне Android PiP. */
+    private fun enterMiniPlayer() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) {
+            Toast.makeText(this, "Мини-экран поддерживается начиная с Android 8", Toast.LENGTH_LONG).show()
+            return
+        }
+        try {
+            val params = PictureInPictureParams.Builder()
+                .setAspectRatio(Rational(16, 9))
+                .build()
+            setPictureInPictureParams(params)
+            enterPictureInPictureMode(params)
+        } catch (t: Throwable) {
+            Toast.makeText(
+                this,
+                "Не удалось открыть мини-экран: ${t.message ?: t.javaClass.simpleName}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        inPictureInPicture = isInPictureInPictureMode
+        if (isInPictureInPictureMode) {
+            headerBar.visibility = View.GONE
+            progress.visibility = View.GONE
+            // If the site has opened its fullscreen video surface, keep that surface
+            // as the PiP content; otherwise the existing WebView remains visible.
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            headerBar.visibility = View.VISIBLE
+            if (fullscreenView != null) {
+                headerBar.visibility = View.GONE
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
         }
     }
 
