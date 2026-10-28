@@ -476,8 +476,9 @@ class OkkoWebActivity : Activity() {
                 """.trimIndent(),
                 null
             )
-            // Do not hide/remove the fullscreen custom view: that can detach its media surface.
-            fullscreenView?.alpha = 0.01f
+            // Keep the fullscreen custom view fully opaque and attached. The Activity is
+            // moved behind other tasks, so its pixels are not visible to the user anyway;
+            // lowering alpha can let the compositor treat the video surface as transparent.
             try {
                 val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
                     .putExtra("web_audio_mode", true)
@@ -488,7 +489,6 @@ class OkkoWebActivity : Activity() {
                 moveTaskToBack(true)
             } catch (t: Throwable) {
                 webAudioBackgroundEnabled = false
-                fullscreenView?.alpha = 1f
                 webView.evaluateJavascript(
                     "window.__okkoBackgroundAudio=false;" +
                         "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
@@ -511,7 +511,6 @@ class OkkoWebActivity : Activity() {
                     "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
                 null
             )
-            fullscreenView?.alpha = 1f
             stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
             backgroundButton.text = "♫ Фон"
             backgroundButton.setBackgroundColor(0xFF343642.toInt())
@@ -692,18 +691,18 @@ class OkkoWebActivity : Activity() {
     }
 
     override fun onPause() {
-        android.util.Log.i("OkkoWebAudio", "Activity onPause; backgroundMode=$webAudioBackgroundEnabled fullscreen=\${fullscreenView != null}")
+        android.util.Log.i("OkkoWebAudio", "Activity onPause; backgroundMode=$webAudioBackgroundEnabled fullscreen=${fullscreenView != null} view=${fullscreenView?.javaClass?.name} shown=${fullscreenView?.isShown} alpha=${fullscreenView?.alpha}")
         super.onPause()
     }
 
     override fun onStop() {
-        android.util.Log.i("OkkoWebAudio", "Activity onStop; backgroundMode=$webAudioBackgroundEnabled fullscreen=\${fullscreenView != null}")
+        android.util.Log.i("OkkoWebAudio", "Activity onStop; backgroundMode=$webAudioBackgroundEnabled fullscreen=${fullscreenView != null} view=${fullscreenView?.javaClass?.name} shown=${fullscreenView?.isShown} alpha=${fullscreenView?.alpha}")
         super.onStop()
     }
 
     override fun onResume() {
         super.onResume()
-        android.util.Log.i("OkkoWebAudio", "Activity onResume; backgroundMode=$webAudioBackgroundEnabled fullscreen=\${fullscreenView != null}")
+        android.util.Log.i("OkkoWebAudio", "Activity onResume; backgroundMode=$webAudioBackgroundEnabled fullscreen=${fullscreenView != null} view=${fullscreenView?.javaClass?.name} shown=${fullscreenView?.isShown} alpha=${fullscreenView?.alpha}")
     }
 
     override fun onDestroy() {
