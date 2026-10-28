@@ -707,6 +707,10 @@ class PlayerActivity : Activity() {
     }
 
     private fun toggleBackgroundPlayback() {
+        if (!backgroundPlaybackEnabled && player == null) {
+            Toast.makeText(this, "Сначала запустите воспроизведение", Toast.LENGTH_SHORT).show()
+            return
+        }
         backgroundPlaybackEnabled = !backgroundPlaybackEnabled
         getSharedPreferences("player_settings", MODE_PRIVATE).edit()
             .putBoolean("background_playback", backgroundPlaybackEnabled).apply()
@@ -745,6 +749,15 @@ class PlayerActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        if (backgroundPlaybackEnabled) {
+            PlaybackHolder.player?.let { retained ->
+                player = retained
+                playerView.player = retained
+                applyAudioOnlyMode(retained)
+                updatePlaybackButtons()
+                return
+            }
+        }
         if (resumeOnStart) {
             resumeOnStart = false
             // Плеер освобождается в onStop(), поэтому создаём его заново: так Surface и
@@ -760,7 +773,7 @@ class PlayerActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
-        if (backgroundPlaybackEnabled && player?.playWhenReady == true) {
+        if (backgroundPlaybackEnabled && player != null) {
             playerView.player = null
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             return
@@ -771,7 +784,7 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         if (::volumeSwipe.isInitialized) volumeSwipe.release()
-        if (backgroundPlaybackEnabled && player?.playWhenReady == true) {
+        if (backgroundPlaybackEnabled && player != null) {
             playerView.player = null
         } else {
             releasePlayer()
