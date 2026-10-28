@@ -394,8 +394,9 @@ class PlayerActivity : Activity() {
                     if (httpHeaders.isNotEmpty()) setDefaultRequestProperties(httpHeaders)
                 }
             // Если аппаратный декодер не справился, пробуем запасной.
-            val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-            val exo = ExoPlayer.Builder(this, renderers)
+            val renderers = DefaultRenderersFactory(applicationContext).setEnableDecoderFallback(true)
+            // Application context avoids retaining the Activity while playback continues in the background.
+            val exo = ExoPlayer.Builder(applicationContext, renderers)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory))
                 .build()
             player = exo
