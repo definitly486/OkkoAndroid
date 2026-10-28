@@ -402,16 +402,59 @@ class OkkoWebActivity : Activity() {
     private fun toggleWebAudioBackground() {
         if (!webAudioBackgroundEnabled) {
             webAudioBackgroundEnabled = true
+            // Keep the original WebView media element and stream. Some sites pause
+            // HTML media on visibilitychange/page hide; while the user explicitly
+            // enabled background audio, retry playback only if it was already playing.
             webView.evaluateJavascript(
-                "(function(){document.querySelectorAll('video').forEach(function(v){" +
-                    "if(!v.hasAttribute('data-okko-original-style')){" +
-                    "v.setAttribute('data-okko-original-style',v.getAttribute('style')||'');}" +
-                    // Сохраняем layout и видимость элемента для движка; скрываем только картинку.
-                    "v.style.setProperty('opacity','0.01','important');" +
-                    "});return true;})()",
+                """
+                (function() {
+                  window.__okkoBackgroundAudio = true;
+                  function attach(v) {
+                    if (v.__okkoBgAudioAttached) return;
+                    v.__okkoBgAudioAttached = true;
+                    v.__okkoBgWasPlaying = !v.paused && !v.ended;
+                    v.addEventListener('play', function() { v.__okkoBgWasPlaying = true; }, true);
+                    v.addEventListener('playing', function() { v.__okkoBgWasPlaying = true; }, true);
+                    v.addEventListener('pause', function() {
+                      if (!window.__okkoBackgroundAudio || !document.hidden ||
+                          !v.__okkoBgWasPlaying || v.ended) return;
+                      // Defer until the site's pause handler has completed.
+                      Promise.resolve().then(function() {
+                        if (window.__okkoBackgroundAudio && document.hidden &&
+                            v.__okkoBgWasPlaying && !v.ended) {
+                          var p = v.play();
+                          if (p && p.catch) p.catch(function() {});
+                        }
+                      });
+                    }, true);
+                    if (!v.hasAttribute('data-okko-original-style')) {
+                      v.setAttribute('data-okko-original-style', v.getAttribute('style') || '');
+                    }
+                    // Hide pixels without removing the media element or changing its layout.
+                    v.style.setProperty('opacity', '0.01', 'important');
+                  }
+                  document.querySelectorAll('video,audio').forEach(attach);
+                  if (!window.__okkoBgAudioObserver) {
+                    window.__okkoBgAudioObserver = new MutationObserver(function() {
+                      document.querySelectorAll('video,audio').forEach(attach);
+                    });
+                    window.__okkoBgAudioObserver.observe(document.documentElement,
+                      {childList:true, subtree:true});
+                  }
+                  document.addEventListener('visibilitychange', function() {
+                    if (!window.__okkoBackgroundAudio || !document.hidden) return;
+                    document.querySelectorAll('video,audio').forEach(function(v) {
+                      if (v.__okkoBgWasPlaying && v.paused && !v.ended) {
+                        var p = v.play(); if (p && p.catch) p.catch(function(){});
+                      }
+                    });
+                  });
+                  return true;
+                })()
+                """.trimIndent(),
                 null
             )
-            // Не использовать GONE: у SurfaceView/WebView это может остановить видео и звук.
+            // Do not hide/remove the fullscreen custom view: that can detach its media surface.
             fullscreenView?.alpha = 0.01f
             try {
                 val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
@@ -419,16 +462,18 @@ class OkkoWebActivity : Activity() {
                 if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
                 backgroundButton.text = "♫ Звук вкл."
                 backgroundButton.setBackgroundColor(ACCENT)
-                Toast.makeText(this, "Режим фонового звука включён", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Фоновый звук включён; WebView продолжает воспроизведение", Toast.LENGTH_SHORT).show()
                 moveTaskToBack(true)
             } catch (t: Throwable) {
                 webAudioBackgroundEnabled = false
                 fullscreenView?.alpha = 1f
                 webView.evaluateJavascript(
-                    "(function(){document.querySelectorAll('video[data-okko-original-style]').forEach(function(v){" +
+                    "window.__okkoBackgroundAudio=false;" +
+                        "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
+                        "(function(){document.querySelectorAll('[data-okko-original-style]').forEach(function(v){" +
                         "var s=v.getAttribute('data-okko-original-style');" +
                         "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
-                        "v.removeAttribute('data-okko-original-style');});return true;})()",
+                        "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
                     null
                 )
                 Toast.makeText(this, "Не удалось включить фон: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
@@ -436,10 +481,12 @@ class OkkoWebActivity : Activity() {
         } else {
             webAudioBackgroundEnabled = false
             webView.evaluateJavascript(
-                "(function(){document.querySelectorAll('video[data-okko-original-style]').forEach(function(v){" +
+                "window.__okkoBackgroundAudio=false;" +
+                    "if(window.__okkoBgAudioObserver){window.__okkoBgAudioObserver.disconnect();window.__okkoBgAudioObserver=null;}" +
+                    "(function(){document.querySelectorAll('[data-okko-original-style]').forEach(function(v){" +
                     "var s=v.getAttribute('data-okko-original-style');" +
                     "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
-                    "v.removeAttribute('data-okko-original-style');});return true;})()",
+                    "v.removeAttribute('data-okko-original-style');v.__okkoBgAudioAttached=false;});return true;})()",
                 null
             )
             fullscreenView?.alpha = 1f
