@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Иконка для Android 7.0–7.1 (API 24–25); с Android 8 используется adaptive-icon из mipmap-anydpi-v26 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <corners android:radius="11dp" />
+        <gradient
+            android:angle="270"
+            android:startColor="#1A1B23"
+            android:endColor="#07080E" />
+        </shape>
+    </item>
+    <item android:drawable="@drawable/ic_launcher_foreground_legacy" />
+</layer-list>
