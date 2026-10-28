@@ -4,14 +4,10 @@ package ru.example.okko
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Color
-import android.media.AudioManager
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.PermissionRequest
@@ -26,8 +22,6 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
-import kotlin.math.abs
-import kotlin.math.roundToInt
 
 class OkkoWebActivity : Activity() {
 
@@ -37,23 +31,10 @@ class OkkoWebActivity : Activity() {
         private const val BG = 0xFF0C0D12.toInt()
         private const val ACCENT = 0xFFFF486E.toInt()
         private const val MAX_MANIFESTS = 12
-
-        // Ширина правой зоны, где вертикальный свайп меняет громкость (доля ширины экрана, но не уже 56dp).
-        private const val VOLUME_ZONE_FRACTION = 0.16f
-        // Какая часть высоты экрана соответствует полному диапазону громкости.
-        private const val VOLUME_SWIPE_RANGE = 0.5f
     }
 
-    // --- Громкость свайпом по правому краю ---
-    private lateinit var audioManager: AudioManager
-    private lateinit var volumeIndicator: TextView
-    private val volumeHandler = Handler(Looper.getMainLooper())
-    private val hideVolumeIndicator = Runnable { volumeIndicator.visibility = View.GONE }
-    private var volumeTracking = false   // касание началось в зоне громкости
-    private var volumeActive = false     // жест распознан как регулировка громкости
-    private var volBaseY = 0f
-    private var volDownX = 0f
-    private var volStartLevel = 0
+    // Громкость свайпом по правому краю (работает и в полноэкранном видео).
+    private lateinit var volumeSwipe: VolumeSwipeController
 
     private lateinit var webView: WebView
     private lateinit var progress: ProgressBar
@@ -176,27 +157,7 @@ class OkkoWebActivity : Activity() {
             )
         )
 
-        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-        // Кнопки громкости на корпусе всегда меняют громкость медиа.
-        volumeControlStream = AudioManager.STREAM_MUSIC
-        volumeIndicator = TextView(this).apply {
-            textSize = 18f
-            setTextColor(Color.WHITE)
-            setPadding(dp(18), dp(10), dp(18), dp(10))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(0xCC000000.toInt())
-                cornerRadius = dp(22).toFloat()
-            }
-            visibility = View.GONE
-        }
-        root.addView(
-            volumeIndicator,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply { topMargin = dp(90) }
-        )
+        volumeSwipe = VolumeSwipeController(this, root)
 
         setContentView(root)
 
@@ -584,75 +545,13 @@ class OkkoWebActivity : Activity() {
         }
     }
 
-    /**
-     * Вертикальный свайп в правой части экрана меняет громкость (вверх — громче, вниз — тише).
-     * Обычные касания и горизонтальные жесты в этой зоне доходят до страницы как раньше;
-     * только когда жест распознан как вертикальный, страница получает ACTION_CANCEL и не прокручивается.
-     */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (!::audioManager.isInitialized) return super.dispatchTouchEvent(ev)
-        when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                volumeActive = false
-                val zone = (root.width * VOLUME_ZONE_FRACTION).coerceAtLeast(dp(56).toFloat())
-                volumeTracking = ev.x >= root.width - zone
-                if (volumeTracking) volDownX = ev.x
-                // Старт жеста с нуля: базовая точка и уровень фиксируются при распознавании свайпа.
-                volBaseY = ev.y
-            }
-            MotionEvent.ACTION_MOVE -> if (volumeTracking) {
-                if (!volumeActive) {
-                    val slop = ViewConfiguration.get(this).scaledTouchSlop
-                    val dx = ev.x - volDownX
-                    val dy = ev.y - volBaseY
-                    if (abs(dy) > slop && abs(dy) > abs(dx) * 1.5f) {
-                        volumeActive = true
-                        volBaseY = ev.y
-                        volStartLevel = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                        val cancel = MotionEvent.obtain(ev)
-                        cancel.action = MotionEvent.ACTION_CANCEL
-                        super.dispatchTouchEvent(cancel)
-                        cancel.recycle()
-                    }
-                }
-                if (volumeActive) {
-                    applyVolumeSwipe(ev.y)
-                    return true
-                }
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                val wasActive = volumeActive
-                volumeTracking = false
-                volumeActive = false
-                if (wasActive) {
-                    volumeHandler.removeCallbacks(hideVolumeIndicator)
-                    volumeHandler.postDelayed(hideVolumeIndicator, 800)
-                    return true
-                }
-            }
-        }
-        return super.dispatchTouchEvent(ev)
-    }
-
-    private fun applyVolumeSwipe(y: Float) {
-        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        if (max <= 0) return
-        val range = (root.height * VOLUME_SWIPE_RANGE).coerceAtLeast(1f)
-        val level = (volStartLevel + (volBaseY - y) / range * max).roundToInt().coerceIn(0, max)
-        try {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
-        } catch (_: SecurityException) {
-            // Например, режим «Не беспокоить» запрещает менять громкость — просто показываем текущую.
-        }
-        val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        val percent = (current * 100f / max).roundToInt()
-        volumeIndicator.text = (if (current == 0) "🔇 " else "🔊 ") + percent + "%"
-        volumeIndicator.visibility = View.VISIBLE
-        volumeHandler.removeCallbacks(hideVolumeIndicator)
+        if (!::volumeSwipe.isInitialized) return super.dispatchTouchEvent(ev)
+        return volumeSwipe.dispatch(ev) { super.dispatchTouchEvent(it) }
     }
 
     override fun onDestroy() {
-        volumeHandler.removeCallbacksAndMessages(null)
+        if (::volumeSwipe.isInitialized) volumeSwipe.release()
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()

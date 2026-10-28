@@ -13,6 +13,7 @@ import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -71,6 +72,12 @@ class PlayerActivity : Activity() {
     // Итоговое объяснение, почему нет картинки; не даём ему затираться общими статусами плеера.
     private var blockedMessage: String? = null
     private lateinit var backToPageButton: Button
+    private lateinit var volumeSwipe: VolumeSwipeController
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!::volumeSwipe.isInitialized) return super.dispatchTouchEvent(ev)
+        return volumeSwipe.dispatch(ev) { super.dispatchTouchEvent(it) }
+    }
 
     // Элементы, нужные для переключения полноэкранного режима.
     private lateinit var rootFrame: FrameLayout
@@ -90,6 +97,8 @@ class PlayerActivity : Activity() {
         window.statusBarColor = bg
         window.navigationBarColor = bg
         buildUi()
+        // Громкость свайпом по правому краю — в полноэкранном режиме плеера.
+        volumeSwipe = VolumeSwipeController(this, rootFrame) { isFullscreen }
         safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
         // These extras are intended for an authorized integration that already
         // has provider-issued playback and license URLs. The WebView does not
@@ -662,6 +671,7 @@ class PlayerActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (::volumeSwipe.isInitialized) volumeSwipe.release()
         releasePlayer()
         super.onDestroy()
     }
