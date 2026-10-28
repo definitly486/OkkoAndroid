@@ -208,6 +208,7 @@ class PlayerActivity : Activity() {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         hideSystemBars()
         fullscreenButton.text = "⤢"
+        reattachPlayer()
     }
 
     private fun exitFullscreen() {
@@ -219,6 +220,16 @@ class PlayerActivity : Activity() {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         showSystemBars()
         fullscreenButton.text = "⛶"
+        reattachPlayer()
+    }
+
+    /** После переноса PlayerView между родителями пересоздаём Surface, иначе кадр остаётся чёрным. */
+    private fun reattachPlayer() {
+        val p = player ?: return
+        playerView.post {
+            playerView.player = null
+            playerView.player = p
+        }
     }
 
     private fun hideSystemBars() {
@@ -362,6 +373,14 @@ class PlayerActivity : Activity() {
                     }
                     videoInfo = if (hasVideo) sb.toString().trim() else "В потоке нет видеодорожки (только звук?)."
                     Log.d(LOG_TAG, videoInfo)
+                    // Показываем причину чёрного экрана сразу, не дожидаясь таймера:
+                    // видеодорожки есть, но ни одна не поддерживается декодером устройства.
+                    val anySupportedVideo = tracks.groups.any { g ->
+                        g.type == C.TRACK_TYPE_VIDEO && (0 until g.length).any { i -> g.isTrackSupported(i) }
+                    }
+                    if (!anySupportedVideo) {
+                        status.text = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$videoInfo"
+                    }
                 }
 
                 override fun onRenderedFirstFrame() {
@@ -458,19 +477,23 @@ class PlayerActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        val exo = player
-        if (exo != null && resumeOnStart) {
+        if (resumeOnStart) {
             resumeOnStart = false
-            // Для прямого эфира после паузы возвращаемся к живому краю, иначе окно может уйти.
-            if (exo.isCurrentMediaItemLive) exo.seekToDefaultPosition()
-            exo.play()
+            // Плеер освобождается в onStop(), поэтому создаём его заново: так Surface и
+            // аппаратный декодер не остаются «чёрными» после возврата в приложение,
+            // а прямой эфир стартует с живого края.
+            if (streamInput.text.isNotBlank()) {
+                safe("resumePlayback") {
+                    if (licenseInput.text.isNotBlank()) playWithWidevine() else playWithoutDrm()
+                }
+            }
         }
     }
 
     override fun onStop() {
         super.onStop()
         resumeOnStart = player?.playWhenReady == true
-        player?.pause()
+        releasePlayer()
     }
 
     override fun onDestroy() {
