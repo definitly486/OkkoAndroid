@@ -10,6 +10,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -262,6 +263,13 @@ class OkkoWebActivity : Activity() {
 
         chromeClient = object : WebChromeClient() {
 
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                if (consoleMessage.message().startsWith("OKKO_BG_AUDIO:")) {
+                    android.util.Log.i("OkkoWebAudio", consoleMessage.message())
+                }
+                return true
+            }
+
             // Route target="_blank" / window.open links into the existing WebView.
             // A hidden child WebView is used only to capture the requested URL;
             // no Android browser or external activity is started.
@@ -409,10 +417,22 @@ class OkkoWebActivity : Activity() {
                 """
                 (function() {
                   window.__okkoBackgroundAudio = true;
+                  function report(v, eventName) {
+                    try { console.log('OKKO_BG_AUDIO:event=' + eventName +
+                      ',tag=' + v.tagName + ',paused=' + v.paused + ',ended=' + v.ended +
+                      ',readyState=' + v.readyState + ',networkState=' + v.networkState +
+                      ',currentTime=' + Math.round(v.currentTime) + ',error=' + (v.error ? v.error.code : 0) +
+                      ',hidden=' + document.hidden); } catch (_) {}
+                  }
+                  console.log('OKKO_BG_AUDIO:enabled hidden=' + document.hidden +
+                    ' url=' + location.href + ' mediaCount=' + document.querySelectorAll('video,audio').length);
                   function attach(v) {
                     if (v.__okkoBgAudioAttached) return;
                     v.__okkoBgAudioAttached = true;
                     v.__okkoBgWasPlaying = !v.paused && !v.ended;
+                    ['play','playing','pause','waiting','stalled','suspend','ended','error','emptied','abort'].forEach(function(name) {
+                      v.addEventListener(name, function() { report(v, name); }, true);
+                    });
                     v.addEventListener('play', function() { v.__okkoBgWasPlaying = true; }, true);
                     v.addEventListener('playing', function() { v.__okkoBgWasPlaying = true; }, true);
                     v.addEventListener('pause', function() {
@@ -442,6 +462,8 @@ class OkkoWebActivity : Activity() {
                       {childList:true, subtree:true});
                   }
                   document.addEventListener('visibilitychange', function() {
+                    console.log('OKKO_BG_AUDIO:visibility hidden=' + document.hidden +
+                      ' mediaCount=' + document.querySelectorAll('video,audio').length);
                     if (!window.__okkoBackgroundAudio || !document.hidden) return;
                     document.querySelectorAll('video,audio').forEach(function(v) {
                       if (v.__okkoBgWasPlaying && v.paused && !v.ended) {
@@ -669,7 +691,23 @@ class OkkoWebActivity : Activity() {
         return volumeSwipe.dispatch(ev) { super.dispatchTouchEvent(it) }
     }
 
+    override fun onPause() {
+        android.util.Log.i("OkkoWebAudio", "Activity onPause; backgroundMode=$webAudioBackgroundEnabled fullscreen=\${fullscreenView != null}")
+        super.onPause()
+    }
+
+    override fun onStop() {
+        android.util.Log.i("OkkoWebAudio", "Activity onStop; backgroundMode=$webAudioBackgroundEnabled fullscreen=\${fullscreenView != null}")
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        android.util.Log.i("OkkoWebAudio", "Activity onResume; backgroundMode=$webAudioBackgroundEnabled fullscreen=\${fullscreenView != null}")
+    }
+
     override fun onDestroy() {
+        android.util.Log.i("OkkoWebAudio", "Activity onDestroy; backgroundMode=$webAudioBackgroundEnabled")
         if (::volumeSwipe.isInitialized) volumeSwipe.release()
         if (::webView.isInitialized) {
             webView.stopLoading()
