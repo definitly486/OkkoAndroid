@@ -28,6 +28,8 @@
         <activity
             android:name=".OkkoWebActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
             android:hardwareAccelerated="true"
             android:exported="true">
 
