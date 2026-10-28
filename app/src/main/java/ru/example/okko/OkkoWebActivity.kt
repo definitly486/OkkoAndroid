@@ -417,6 +417,7 @@ class OkkoWebActivity : Activity() {
             fullscreenView?.visibility = View.GONE
             try {
                 val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
+                    .putExtra("web_audio_mode", true)
                 if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
                 backgroundButton.text = "♫ Звук вкл."
                 backgroundButton.setBackgroundColor(ACCENT)
