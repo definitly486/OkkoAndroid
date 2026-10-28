@@ -2,6 +2,8 @@ package ru.example.okko
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaDrm
 import android.net.Uri
 import android.os.Build
@@ -177,6 +179,10 @@ class PlayerActivity : Activity() {
         body.addView(space(8))
         body.addView(button("Проверить Widevine на устройстве", false) {
             safe("widevineDiagnostics") { status.text = widevineDiagnostics() }
+        }, matchWrap())
+        body.addView(space(8))
+        body.addView(button("Проверить видеокодеки (H.264)", false) {
+            safe("codecDiagnostics") { status.text = codecDiagnostics() }
         }, matchWrap())
         body.addView(space(12))
         body.addView(label("Примечание: кнопка «Плеер» на экране Okko открывает этот экран, но не передаёт автоматически фильм из каталога. Для такой интеграции требуется официальный интерфейс воспроизведения Okko.", 12f, muted))
@@ -365,7 +371,8 @@ class PlayerActivity : Activity() {
                         hasVideo = true
                         for (i in 0 until group.length) {
                             val f = group.getTrackFormat(i)
-                            sb.append("Видео: ${f.sampleMimeType} ${f.codecs ?: ""} ${f.width}x${f.height}, ")
+                            val fps = if (f.frameRate > 0f) " ${f.frameRate}fps" else ""
+                            sb.append("Видео: ${f.sampleMimeType} ${f.codecs ?: ""} ${f.width}x${f.height}$fps, ")
                                 .append("декодер ${if (group.isTrackSupported(i)) "поддерживается" else "НЕ поддерживается"}, ")
                                 .append(if (group.isTrackSelected(i)) "выбрана" else "не выбрана")
                                 .append('\n')
@@ -379,7 +386,10 @@ class PlayerActivity : Activity() {
                         g.type == C.TRACK_TYPE_VIDEO && (0 until g.length).any { i -> g.isTrackSupported(i) }
                     }
                     if (!anySupportedVideo) {
-                        status.text = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$videoInfo"
+                        val codecs = runCatching { codecDiagnostics() }
+                            .getOrElse { "Список кодеков недоступен: ${it.javaClass.simpleName}: ${it.message}" }
+                        Log.d(LOG_TAG, codecs)
+                        status.text = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$videoInfo\n\n$codecs"
                     }
                 }
 
@@ -460,6 +470,87 @@ class PlayerActivity : Activity() {
         } catch (e: Exception) {
             "Widevine обнаружен, но диагностика не завершилась: ${e.javaClass.simpleName}: ${e.message ?: "нет подробностей"}"
         }
+    }
+
+    /**
+     * Перечисляет все H.264-декодеры устройства (аппаратные и программные) с профилями/уровнями,
+     * допустимыми размерами и частотой кадров. Помогает понять, почему Media3 считает дорожки
+     * потока неподдерживаемыми, хотя WebView их воспроизводит.
+     */
+    private fun codecDiagnostics(): String {
+        val mime = "video/avc"
+        val sb = StringBuilder("H.264-декодеры устройства ($mime):")
+        val infos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        var found = 0
+        for (info in infos) {
+            if (info.isEncoder || info.supportedTypes.none { it.equals(mime, true) }) continue
+            found++
+            sb.append("\n• ").append(info.name)
+            if (Build.VERSION.SDK_INT >= 29) {
+                sb.append(if (info.isHardwareAccelerated) " [аппаратный]" else " [не аппаратный]")
+                if (info.isSoftwareOnly) sb.append(" [программный]")
+                if (info.isAlias) sb.append(" [alias]")
+            }
+            try {
+                val caps = info.getCapabilitiesForType(mime)
+                val profiles = caps.profileLevels
+                    .groupBy { it.profile }
+                    .entries
+                    .joinToString("; ") { (p, l) -> "${avcProfileName(p)} ≤ ${avcLevelName(l.maxOf { it.level })}" }
+                sb.append("\n  профили: ").append(profiles.ifBlank { "не заявлены" })
+                val secure = caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_SecurePlayback)
+                val secureReq = caps.isFeatureRequired(MediaCodecInfo.CodecCapabilities.FEATURE_SecurePlayback)
+                sb.append("\n  secure: ").append(if (secureReq) "обязателен" else if (secure) "доступен" else "нет")
+                val vc = caps.videoCapabilities
+                if (vc != null) {
+                    sb.append("\n  размеры: ${vc.supportedWidths}×${vc.supportedHeights}")
+                    sb.append("\n  кадры/с: ${vc.supportedFrameRates}")
+                    val checks = listOf(
+                        Triple(426, 240, 25.0), Triple(854, 480, 25.0), Triple(1280, 720, 25.0),
+                        Triple(1280, 720, 50.0), Triple(1920, 1080, 25.0), Triple(1920, 1080, 50.0)
+                    )
+                    sb.append("\n  проверка: ").append(checks.joinToString(", ") { (w, h, r) ->
+                        "${w}x$h@${r.toInt()}=" + if (vc.areSizeAndRateSupported(w, h, r)) "да" else "нет"
+                    })
+                }
+            } catch (t: Throwable) {
+                sb.append("\n  ошибка чтения возможностей: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        }
+        if (found == 0) sb.append("\nНи одного H.264-декодера не найдено.")
+        return sb.toString()
+    }
+
+    private fun avcProfileName(profile: Int): String = when (profile) {
+        MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline -> "Baseline"
+        MediaCodecInfo.CodecProfileLevel.AVCProfileMain -> "Main"
+        MediaCodecInfo.CodecProfileLevel.AVCProfileExtended -> "Extended"
+        MediaCodecInfo.CodecProfileLevel.AVCProfileHigh -> "High"
+        MediaCodecInfo.CodecProfileLevel.AVCProfileHigh10 -> "High10"
+        MediaCodecInfo.CodecProfileLevel.AVCProfileHigh422 -> "High422"
+        MediaCodecInfo.CodecProfileLevel.AVCProfileHigh444 -> "High444"
+        else -> "profile 0x" + profile.toString(16)
+    }
+
+    private fun avcLevelName(level: Int): String = when (level) {
+        MediaCodecInfo.CodecProfileLevel.AVCLevel1 -> "1"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel1b -> "1b"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel11 -> "1.1"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel12 -> "1.2"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel13 -> "1.3"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel2 -> "2"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel21 -> "2.1"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel22 -> "2.2"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel3 -> "3"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel31 -> "3.1"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel32 -> "3.2"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel4 -> "4"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel41 -> "4.1"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel42 -> "4.2"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel5 -> "5"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel51 -> "5.1"
+        MediaCodecInfo.CodecProfileLevel.AVCLevel52 -> "5.2"
+        else -> "0x" + level.toString(16)
     }
 
     private fun isHttps(value: String): Boolean = runCatching {
