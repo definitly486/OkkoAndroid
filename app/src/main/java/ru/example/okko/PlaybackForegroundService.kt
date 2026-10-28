@@ -23,6 +23,7 @@ class PlaybackForegroundService : Service() {
     }
 
     private var activePlayer: ExoPlayer? = null
+    private var webAudioMode = false
 
     override fun onCreate() {
         super.onCreate()
@@ -41,10 +42,12 @@ class PlaybackForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         activePlayer = PlaybackHolder.player
+        webAudioMode = intent?.getBooleanExtra("web_audio_mode", false) == true
+        val targetActivity = if (webAudioMode) OkkoWebActivity::class.java else PlayerActivity::class.java
         val openPlayer = PendingIntent.getActivity(
             this,
-            0,
-            Intent(this, PlayerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            if (webAudioMode) 1 else 0,
+            Intent(this, targetActivity).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or
                 (if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0)
         )
