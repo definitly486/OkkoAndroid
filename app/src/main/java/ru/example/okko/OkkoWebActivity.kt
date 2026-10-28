@@ -138,12 +138,33 @@ class OkkoWebActivity : Activity() {
             contentDescription = "Открыть видео в маленьком плавающем окне"
             setOnClickListener { enterMiniPlayer() }
         }
+        backgroundButton.text = "▣ Мини-экран"
+        backgroundButton.contentDescription = "Открыть видео в маленьком плавающем окне"
+        backgroundButton.setOnClickListener { enterMiniPlayer() }
+
         val backgroundButtonContainer = LinearLayout(this).apply {
             gravity = Gravity.CENTER
-            setPadding(0, 0, dp(10), 0)
+            setPadding(0, 0, dp(8), 0)
             addView(backgroundButton, LinearLayout.LayoutParams(-2, dp(38)))
         }
         headerBar.addView(backgroundButtonContainer, LinearLayout.LayoutParams(-2, -1))
+
+        val audioOnlyButton = TextView(this).apply {
+            text = "♫ Только звук"
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(9), dp(8), dp(9), dp(8))
+            setBackgroundColor(0xFF343642.toInt())
+            contentDescription = "Продолжить звук в фоне"
+            setOnClickListener { toggleWebAudioBackground() }
+        }
+        val audioOnlyButtonContainer = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, 0, dp(8), 0)
+            addView(audioOnlyButton, LinearLayout.LayoutParams(-2, dp(38)))
+        }
+        headerBar.addView(audioOnlyButtonContainer, LinearLayout.LayoutParams(-2, -1))
 
         page.addView(headerBar, LinearLayout.LayoutParams(-1, dp(52)))
 
@@ -529,9 +550,7 @@ class OkkoWebActivity : Activity() {
                 val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
                     .putExtra("web_audio_mode", true)
                 if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
-                backgroundButton.text = "♫ Звук вкл."
-                backgroundButton.setBackgroundColor(ACCENT)
-                Toast.makeText(this, "Фоновый звук включён; WebView продолжает воспроизведение", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Режим звука включён. Для полного выключения дисплея нажмите кнопку питания.", Toast.LENGTH_LONG).show()
                 moveTaskToBack(true)
             } catch (t: Throwable) {
                 webAudioBackgroundEnabled = false
@@ -558,8 +577,6 @@ class OkkoWebActivity : Activity() {
                 null
             )
             stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
-            backgroundButton.text = "♫ Фон"
-            backgroundButton.setBackgroundColor(0xFF343642.toInt())
             Toast.makeText(this, "Фоновый режим выключен", Toast.LENGTH_SHORT).show()
         }
     }
