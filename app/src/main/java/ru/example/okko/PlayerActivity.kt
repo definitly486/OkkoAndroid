@@ -25,6 +25,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -375,10 +376,22 @@ class PlayerActivity : Activity() {
                             sb.append("Видео: ${f.sampleMimeType} ${f.codecs ?: ""} ${f.width}x${f.height}$fps, ")
                                 .append("декодер ${if (group.isTrackSupported(i)) "поддерживается" else "НЕ поддерживается"}, ")
                                 .append(if (group.isTrackSelected(i)) "выбрана" else "не выбрана")
+                                .append("\n    поддержка: ${formatSupportName(group.getTrackSupport(i))}; ${drmInfo(f)}")
                                 .append('\n')
                         }
                     }
-                    videoInfo = if (hasVideo) sb.toString().trim() else "В потоке нет видеодорожки (только звук?)."
+                    // Аудиодорожки: проверяем, играет ли хотя бы звук и не зашифрован ли он.
+                    for (group in tracks.groups) {
+                        if (group.type != C.TRACK_TYPE_AUDIO) continue
+                        for (i in 0 until group.length) {
+                            val f = group.getTrackFormat(i)
+                            sb.append("Аудио: ${f.sampleMimeType} ${f.codecs ?: ""}, ")
+                                .append(if (group.isTrackSelected(i)) "выбрана" else "не выбрана")
+                                .append("\n    поддержка: ${formatSupportName(group.getTrackSupport(i))}; ${drmInfo(f)}")
+                                .append('\n')
+                        }
+                    }
+                    videoInfo = if (hasVideo) sb.toString().trim() else "В потоке нет видеодорожки (только звук?).\n" + sb.toString().trim()
                     Log.d(LOG_TAG, videoInfo)
                     // Показываем причину чёрного экрана сразу, не дожидаясь таймера:
                     // видеодорожки есть, но ни одна не поддерживается декодером устройства.
@@ -389,7 +402,14 @@ class PlayerActivity : Activity() {
                         val codecs = runCatching { codecDiagnostics() }
                             .getOrElse { "Список кодеков недоступен: ${it.javaClass.simpleName}: ${it.message}" }
                         Log.d(LOG_TAG, codecs)
-                        status.text = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$videoInfo\n\n$codecs"
+                        val encrypted = tracks.groups.any { g ->
+                            g.type == C.TRACK_TYPE_VIDEO &&
+                                (0 until g.length).any { i -> g.getTrackFormat(i).drmInitData != null }
+                        }
+                        val hint = if (encrypted && licenseInput.text.isBlank()) {
+                            "Поток зашифрован, а URL лицензии не задан: без DRM-конфигурации видео не воспроизводится.\n\n"
+                        } else ""
+                        status.text = "Нет поддерживаемой видеодорожки (звук может играть без картинки):\n$hint$videoInfo\n\n$codecs"
                     }
                 }
 
@@ -519,6 +539,30 @@ class PlayerActivity : Activity() {
         }
         if (found == 0) sb.append("\nНи одного H.264-декодера не найдено.")
         return sb.toString()
+    }
+
+    /** Расшифровка кода поддержки формата рендерером Media3. */
+    private fun formatSupportName(support: Int): String = when (support) {
+        C.FORMAT_HANDLED -> "HANDLED (можно воспроизводить)"
+        C.FORMAT_EXCEEDS_CAPABILITIES -> "EXCEEDS_CAPABILITIES (превышает возможности декодера)"
+        C.FORMAT_UNSUPPORTED_DRM -> "UNSUPPORTED_DRM (поток зашифрован, а DRM не настроен)"
+        C.FORMAT_UNSUPPORTED_SUBTYPE -> "UNSUPPORTED_SUBTYPE (нет подходящего декодера/профиля)"
+        C.FORMAT_UNSUPPORTED_TYPE -> "UNSUPPORTED_TYPE (тип/кодек не поддерживается)"
+        else -> "код $support"
+    }
+
+    /** Есть ли в формате данные шифрования (ContentProtection в MPD / EXT-X-KEY) и какие схемы. */
+    private fun drmInfo(format: Format): String {
+        val drm = format.drmInitData ?: return "шифрование: нет"
+        val schemes = (0 until drm.schemeDataCount).joinToString(", ") { idx ->
+            when (val uuid = drm.get(idx).uuid) {
+                C.WIDEVINE_UUID -> "Widevine"
+                C.PLAYREADY_UUID -> "PlayReady"
+                C.CLEARKEY_UUID -> "ClearKey"
+                else -> uuid.toString()
+            }
+        }
+        return "шифрование: ДА (${drm.schemeType ?: "?"}; $schemes)"
     }
 
     private fun avcProfileName(profile: Int): String = when (profile) {
