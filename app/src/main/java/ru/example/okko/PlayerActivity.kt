@@ -6,6 +6,8 @@ import android.media.MediaDrm
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import android.view.Gravity
@@ -24,7 +26,9 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
@@ -54,6 +58,9 @@ class PlayerActivity : Activity() {
     private lateinit var playerView: PlayerView
     private var player: ExoPlayer? = null
     private var resumeOnStart = false
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var firstFrameRendered = false
+    private var videoInfo = ""
     private var liveWindowRetries = 0
 
     // Элементы, нужные для переключения полноэкранного режима.
@@ -300,6 +307,8 @@ class PlayerActivity : Activity() {
                 "Подключение к потоку и запрос лицензии Widevine…"
             }
             liveWindowRetries = 0
+            firstFrameRendered = false
+            videoInfo = ""
             val itemBuilder = MediaItem.Builder().setUri(Uri.parse(stream))
             if (drmConfiguration != null) itemBuilder.setDrmConfiguration(drmConfiguration)
             // Для прямых эфиров (HLS live): небольшое ускорение, чтобы догонять «живой» край.
@@ -312,7 +321,9 @@ class PlayerActivity : Activity() {
                     userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }
                     if (httpHeaders.isNotEmpty()) setDefaultRequestProperties(httpHeaders)
                 }
-            val exo = ExoPlayer.Builder(this)
+            // Если аппаратный декодер не справился, пробуем запасной.
+            val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+            val exo = ExoPlayer.Builder(this, renderers)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory))
                 .build()
             player = exo
@@ -321,11 +332,43 @@ class PlayerActivity : Activity() {
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     when (playbackState) {
                         Player.STATE_BUFFERING -> status.text = "Буферизация: ожидание видео или ответа DRM-лицензии…"
-                        Player.STATE_READY -> status.text = "Плеер готов."
+                        Player.STATE_READY -> {
+                            status.text = "Плеер готов."
+                            // Если через 4 с кадры так и не появились — показываем, что за видеодорожки в потоке.
+                            uiHandler.postDelayed({
+                                if (player === exo && !firstFrameRendered && exo.playWhenReady) {
+                                    status.text = "Плеер готов, но кадры не отрисованы.\n" +
+                                        videoInfo.ifBlank { "Сведений о видеодорожках нет." }
+                                }
+                            }, 4000)
+                        }
                         Player.STATE_ENDED -> status.text = "Воспроизведение завершено."
                         Player.STATE_IDLE -> Unit
                     }
                 }
+                override fun onTracksChanged(tracks: Tracks) {
+                    val sb = StringBuilder()
+                    var hasVideo = false
+                    for (group in tracks.groups) {
+                        if (group.type != C.TRACK_TYPE_VIDEO) continue
+                        hasVideo = true
+                        for (i in 0 until group.length) {
+                            val f = group.getTrackFormat(i)
+                            sb.append("Видео: ${f.sampleMimeType} ${f.codecs ?: ""} ${f.width}x${f.height}, ")
+                                .append("декодер ${if (group.isTrackSupported(i)) "поддерживается" else "НЕ поддерживается"}, ")
+                                .append(if (group.isTrackSelected(i)) "выбрана" else "не выбрана")
+                                .append('\n')
+                        }
+                    }
+                    videoInfo = if (hasVideo) sb.toString().trim() else "В потоке нет видеодорожки (только звук?)."
+                    Log.d(LOG_TAG, videoInfo)
+                }
+
+                override fun onRenderedFirstFrame() {
+                    firstFrameRendered = true
+                    status.text = "Кадры отображаются."
+                }
+
                 override fun onPlayerError(error: PlaybackException) {
                     Log.e(LOG_TAG, "Ошибка воспроизведения", error)
                     // Позиция вышла за окно прямого эфира (окно ~30 с): возвращаемся к «живому» краю.
@@ -406,6 +449,7 @@ class PlayerActivity : Activity() {
     }.getOrDefault(false)
 
     private fun releasePlayer() {
+        uiHandler.removeCallbacksAndMessages(null)
         playerView.player = null
         player?.release()
         player = null
