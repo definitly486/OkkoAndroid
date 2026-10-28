@@ -12,7 +12,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_21
     }
 
-       signingConfigs {
+    signingConfigs {
         create("release") {
             if (project.hasProperty("MYAPP_RELEASE_STORE_FILE")) {
                 storeFile = file(project.property("MYAPP_RELEASE_STORE_FILE") as String)
@@ -39,7 +39,6 @@ android {
         resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "DebugProbesKt.bin")
     }
 
-
     kotlinOptions {
         jvmTarget = "21"
     }
@@ -50,14 +49,12 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
-        // media3-ui приносит строки на десятках языков, оставляем нужные
         resourceConfigurations += listOf("ru", "en")
     }
 }
 
-
 dependencies {
-    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
     implementation("androidx.media3:media3-exoplayer-dash:1.5.1")
