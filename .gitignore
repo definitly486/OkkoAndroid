@@ -10,5 +10,6 @@ app/build
 keystore.jks
 keystore.properties
 fastlane/fastlane.json
+.gradle
 fastlane/report.xml
 .kotlin/
