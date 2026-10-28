@@ -44,6 +44,8 @@ class OkkoWebActivity : Activity() {
     private lateinit var chromeClient: WebChromeClient
 
     private lateinit var playerButton: TextView
+    private lateinit var backgroundButton: TextView
+    private var webAudioBackgroundEnabled = false
 
     // Последний HLS/DASH-манифест, который страница сама запросила в WebView.
     // Запоминаем несколько последних манифестов (свежие — в конце): у страницы их бывает
@@ -120,6 +122,23 @@ class OkkoWebActivity : Activity() {
             addView(playerButton, LinearLayout.LayoutParams(-2, dp(38)))
         }
         headerBar.addView(playerButtonContainer, LinearLayout.LayoutParams(-2, -1))
+
+        backgroundButton = TextView(this).apply {
+            text = "♫ Фон"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setBackgroundColor(0xFF343642.toInt())
+            contentDescription = "Проигрывать только звук в фоне"
+            setOnClickListener { toggleWebAudioBackground() }
+        }
+        val backgroundButtonContainer = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, 0, dp(10), 0)
+            addView(backgroundButton, LinearLayout.LayoutParams(-2, dp(38)))
+        }
+        headerBar.addView(backgroundButtonContainer, LinearLayout.LayoutParams(-2, -1))
 
         page.addView(headerBar, LinearLayout.LayoutParams(-1, dp(52)))
 
@@ -376,6 +395,53 @@ class OkkoWebActivity : Activity() {
     private fun updatePlayerButton() {
         val found = manifestSnapshot().isNotEmpty()
         playerButton.text = if (found) "▶ Плеер ●" else "Плеер"
+    }
+
+    /** Скрывает видеоряд WebView, оставляя воспроизведение звука, и удерживает процесс сервисом. */
+    private fun toggleWebAudioBackground() {
+        if (!webAudioBackgroundEnabled) {
+            webAudioBackgroundEnabled = true
+            // Скрываем видеоэлементы и полноэкранную поверхность, не останавливая медиаплеер страницы.
+            webView.evaluateJavascript(
+                "(function(){document.querySelectorAll('video').forEach(function(v){" +
+                    "if(!v.hasAttribute('data-okko-original-style')){" +
+                    "v.setAttribute('data-okko-original-style',v.getAttribute('style')||'');}" +
+                    "v.style.setProperty('opacity','0','important');" +
+                    "v.style.setProperty('width','1px','important');" +
+                    "v.style.setProperty('height','1px','important');" +
+                    "v.style.setProperty('position','fixed','important');" +
+                    "v.style.setProperty('left','-10000px','important');" +
+                    "});return true;})()",
+                null
+            )
+            fullscreenView?.visibility = View.GONE
+            try {
+                val serviceIntent = android.content.Intent(this, PlaybackForegroundService::class.java)
+                if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
+                backgroundButton.text = "♫ Звук вкл."
+                backgroundButton.setBackgroundColor(ACCENT)
+                Toast.makeText(this, "Режим фонового звука включён", Toast.LENGTH_SHORT).show()
+                moveTaskToBack(true)
+            } catch (t: Throwable) {
+                webAudioBackgroundEnabled = false
+                fullscreenView?.visibility = View.VISIBLE
+                Toast.makeText(this, "Не удалось включить фон: ${t.message ?: t.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            webAudioBackgroundEnabled = false
+            webView.evaluateJavascript(
+                "(function(){document.querySelectorAll('video[data-okko-original-style]').forEach(function(v){" +
+                    "var s=v.getAttribute('data-okko-original-style');" +
+                    "if(s){v.setAttribute('style',s);}else{v.removeAttribute('style');}" +
+                    "v.removeAttribute('data-okko-original-style');});return true;})()",
+                null
+            )
+            fullscreenView?.visibility = View.VISIBLE
+            stopService(android.content.Intent(this, PlaybackForegroundService::class.java))
+            backgroundButton.text = "♫ Фон"
+            backgroundButton.setBackgroundColor(0xFF343642.toInt())
+            Toast.makeText(this, "Фоновый режим выключен", Toast.LENGTH_SHORT).show()
+        }
     }
 
     /** Результат разбора манифеста. null = определить не удалось. */
