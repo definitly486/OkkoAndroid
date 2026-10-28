@@ -23,11 +23,20 @@ android {
         }
     }
 
-  buildTypes {
+    buildTypes {
         release {
-            isMinifyEnabled = false
-                        signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            signingConfig = signingConfigs.getByName("release")
         }
+    }
+
+    packaging {
+        resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "DebugProbesKt.bin")
     }
 
 
@@ -41,6 +50,8 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+        // media3-ui приносит строки на десятках языков, оставляем нужные
+        resourceConfigurations += listOf("ru", "en")
     }
 }
 
